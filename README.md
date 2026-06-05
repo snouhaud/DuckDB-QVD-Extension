@@ -73,9 +73,19 @@ Types préservés et taggés pour relecture (`BIGINT`/`DOUBLE`/`VARCHAR`/`DATE`/
 `TIMESTAMP`), `NULL` et UTF-8 conservés. Vérifié en round-trip `read_qvd` →
 `COPY` → `read_qvd`.
 
+**Noms de colonnes.** L'API C de la copy function n'expose pas les noms de
+colonnes : par défaut les champs sont `field0`, `field1`, … On peut les fournir
+explicitement via l'option `FIELD_NAMES` (les deux syntaxes sont acceptées) :
+
+```sql
+COPY (SELECT id, montant, jour FROM ventes)
+  TO 'export.qvd' (FORMAT qvd, FIELD_NAMES (id, montant, jour));
+-- ou :  FIELD_NAMES ['id', 'montant', 'jour']
+```
+
+Le nombre de noms doit égaler le nombre de colonnes (sinon erreur).
+
 Limites d'écriture :
-- **Noms de colonnes non préservés** → `field0`, `field1`, … (l'API C de la copy
-  function n'expose pas les noms ; à lever via une future option `FIELD_NAMES`).
 - Types lus : BOOLEAN/TINYINT/SMALLINT/INTEGER/BIGINT/FLOAT/DOUBLE/VARCHAR/DATE/
   TIMESTAMP. Les autres (ex. `DECIMAL`, `HUGEINT`) exigent un `CAST`.
 
@@ -155,7 +165,7 @@ Pour tester sur de vrais QVD : déposer des fichiers dans `test/data/` et adapte
 - [x] Projection pushdown via `from_path_projected` (seules les colonnes utiles décodées).
 - [x] Glob `read_qvd('data/*.qvd')` (lignes concaténées, résolution par nom).
 - [x] Écriture `COPY ... TO ... (FORMAT qvd)` (copy function FFI ; round-trip vérifié).
-- [ ] Préserver les noms de colonnes à l'écriture (option `FIELD_NAMES`).
+- [x] Préserver les noms de colonnes à l'écriture (option `FIELD_NAMES`).
 - [ ] Lecture `COPY ... FROM` / types `DECIMAL` à l'écriture.
 
 ## Licence

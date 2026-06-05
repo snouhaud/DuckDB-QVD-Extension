@@ -106,8 +106,9 @@ impl WriteKind {
     }
 }
 
-/// Données de bind : type d'écriture de chaque colonne.
+/// Données de bind : nom + type d'écriture de chaque colonne.
 struct CopyBindData {
+    names: Vec<String>,
     kinds: Vec<WriteKind>,
 }
 
@@ -115,6 +116,7 @@ struct CopyBindData {
 /// car le `sink` peut être appelé de plusieurs threads).
 struct CopyGlobalState {
     path: String,
+    names: Vec<String>,
     kinds: Vec<WriteKind>,
     columns: Mutex<Vec<Vec<Option<Value>>>>,
 }
@@ -127,8 +129,69 @@ unsafe extern "C" fn destroy_global(data: *mut c_void) {
     drop(Box::from_raw(data as *mut CopyGlobalState));
 }
 
-/// `bind` : récupère le nombre et les types des colonnes.
+/// Collecte récursivement toutes les chaînes feuilles d'une `duckdb_value`
+/// (gère `FIELD_NAMES (a, b, c)` comme `FIELD_NAMES ['a','b','c']`).
+unsafe fn collect_strings(v: ffi::duckdb_value, out: &mut Vec<String>) {
+    let tid = ffi::duckdb_get_type_id(ffi::duckdb_get_value_type(v));
+    match tid {
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR => {
+            let p = ffi::duckdb_get_varchar(v);
+            if !p.is_null() {
+                out.push(CStr::from_ptr(p).to_string_lossy().into_owned());
+                ffi::duckdb_free(p as *mut c_void);
+            }
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST | ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY => {
+            for i in 0..ffi::duckdb_get_list_size(v) {
+                let mut child = ffi::duckdb_get_list_child(v, i);
+                collect_strings(child, out);
+                ffi::duckdb_destroy_value(&mut child);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Lit l'option de COPY `FIELD_NAMES` si présente. Les options de COPY sont
+/// exposées comme un STRUCT { nom_option: valeur, … }.
+unsafe fn read_custom_names(info: ffi::duckdb_copy_function_bind_info) -> Option<Vec<String>> {
+    let mut options = ffi::duckdb_copy_function_bind_get_options(info);
+    if options.is_null() {
+        return None;
+    }
+    let lt = ffi::duckdb_get_value_type(options); // tied to la valeur, ne pas détruire
+    let mut result = None;
+    if ffi::duckdb_get_type_id(lt) == ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT {
+        for i in 0..ffi::duckdb_struct_type_child_count(lt) {
+            let np = ffi::duckdb_struct_type_child_name(lt, i);
+            let name = if np.is_null() {
+                String::new()
+            } else {
+                let s = CStr::from_ptr(np).to_string_lossy().into_owned();
+                ffi::duckdb_free(np as *mut c_void);
+                s
+            };
+            if name.eq_ignore_ascii_case("field_names") {
+                let mut child = ffi::duckdb_get_struct_child(options, i);
+                let mut names = Vec::new();
+                collect_strings(child, &mut names);
+                ffi::duckdb_destroy_value(&mut child);
+                result = Some(names);
+                break;
+            }
+        }
+    }
+    ffi::duckdb_destroy_value(&mut options);
+    result
+}
+
+/// `bind` : récupère le nombre, les types et (option) les noms des colonnes.
 unsafe extern "C" fn copy_bind(info: ffi::duckdb_copy_function_bind_info) {
+    let set_error = |msg: String| {
+        let c = CString::new(msg).unwrap_or_default();
+        ffi::duckdb_copy_function_bind_set_error(info, c.as_ptr());
+    };
+
     let n = ffi::duckdb_copy_function_bind_get_column_count(info) as usize;
     let mut kinds = Vec::with_capacity(n);
     for i in 0..n {
@@ -138,17 +201,29 @@ unsafe extern "C" fn copy_bind(info: ffi::duckdb_copy_function_bind_info) {
         match WriteKind::from_type_id(tid) {
             Some(k) => kinds.push(k),
             None => {
-                let msg = CString::new(format!(
-                    "read_qvd/COPY : type de colonne non supporté (id {tid}) en écriture ; \
+                set_error(format!(
+                    "COPY (FORMAT qvd) : type de colonne non supporté (id {tid}) en écriture ; \
                      CAST vers BIGINT/DOUBLE/VARCHAR/DATE/TIMESTAMP"
-                ))
-                .unwrap();
-                ffi::duckdb_copy_function_bind_set_error(info, msg.as_ptr());
+                ));
                 return;
             }
         }
     }
-    let data = Box::into_raw(Box::new(CopyBindData { kinds }));
+
+    // Noms : option FIELD_NAMES si fournie (sinon field0, field1, …).
+    let names = match read_custom_names(info) {
+        Some(custom) if custom.len() == n => custom,
+        Some(custom) => {
+            set_error(format!(
+                "COPY (FORMAT qvd) : FIELD_NAMES fournit {} noms pour {n} colonnes",
+                custom.len()
+            ));
+            return;
+        }
+        None => (0..n).map(|i| format!("field{i}")).collect(),
+    };
+
+    let data = Box::into_raw(Box::new(CopyBindData { names, kinds }));
     ffi::duckdb_copy_function_bind_set_bind_data(info, data.cast(), Some(destroy_bind));
 }
 
@@ -161,6 +236,7 @@ unsafe extern "C" fn copy_global_init(info: ffi::duckdb_copy_function_global_ini
     let n = bind.kinds.len();
     let state = Box::new(CopyGlobalState {
         path,
+        names: bind.names.clone(),
         kinds: bind.kinds.clone(),
         columns: Mutex::new((0..n).map(|_| Vec::new()).collect()),
     });
@@ -202,7 +278,7 @@ unsafe extern "C" fn copy_finalize(info: ffi::duckdb_copy_function_finalize_info
             .iter()
             .enumerate()
             .map(|(i, vals)| {
-                let mut col = Column::new(format!("field{i}"), vals.clone());
+                let mut col = Column::new(state.names[i].clone(), vals.clone());
                 col.tags = state.kinds[i].tags();
                 col
             })
