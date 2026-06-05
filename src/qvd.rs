@@ -49,6 +49,19 @@ pub(crate) enum ColumnData {
     Date(Vec<Option<i32>>),
     /// Microsecondes depuis 1970-01-01 — type DuckDB `TIMESTAMP`.
     Timestamp(Vec<Option<i64>>),
+    /// Microsecondes depuis minuit — type DuckDB `TIME`.
+    Time(Vec<Option<i64>>),
+    /// Durée (mois/jours/µs) — type DuckDB `INTERVAL`.
+    Interval(Vec<Option<IntervalVal>>),
+}
+
+/// Représentation physique d'un `INTERVAL` DuckDB (`duckdb_interval`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct IntervalVal {
+    pub months: i32,
+    pub days: i32,
+    pub micros: i64,
 }
 
 /// Schéma d'un QVD : noms, catégories et types DuckDB de toutes les colonnes.
@@ -68,6 +81,8 @@ pub(crate) enum Kind {
     Text,
     Date,
     Timestamp,
+    Time,
+    Interval,
 }
 
 impl Kind {
@@ -78,6 +93,8 @@ impl Kind {
             Kind::Text => LogicalTypeId::Varchar,
             Kind::Date => LogicalTypeId::Date,
             Kind::Timestamp => LogicalTypeId::Timestamp,
+            Kind::Time => LogicalTypeId::Time,
+            Kind::Interval => LogicalTypeId::Interval,
         }
     }
 }
@@ -179,6 +196,8 @@ fn empty_column(kind: Kind) -> ColumnData {
         Kind::Text => ColumnData::Utf8(Vec::new()),
         Kind::Date => ColumnData::Date(Vec::new()),
         Kind::Timestamp => ColumnData::Timestamp(Vec::new()),
+        Kind::Time => ColumnData::Time(Vec::new()),
+        Kind::Interval => ColumnData::Interval(Vec::new()),
     }
 }
 
@@ -190,6 +209,8 @@ fn append(dst: &mut ColumnData, src: ColumnData) {
         (ColumnData::Utf8(a), ColumnData::Utf8(b)) => a.extend(b),
         (ColumnData::Date(a), ColumnData::Date(b)) => a.extend(b),
         (ColumnData::Timestamp(a), ColumnData::Timestamp(b)) => a.extend(b),
+        (ColumnData::Time(a), ColumnData::Time(b)) => a.extend(b),
+        (ColumnData::Interval(a), ColumnData::Interval(b)) => a.extend(b),
         _ => unreachable!("types de colonnes cohérents entre fichiers du glob"),
     }
 }
@@ -204,6 +225,12 @@ fn materialize(col: Vec<Option<Value>>, kind: Kind) -> ColumnData {
         Kind::Timestamp => {
             ColumnData::Timestamp(col.into_iter().map(|c| c.and_then(|v| serial_to_micros(&v))).collect())
         }
+        Kind::Time => {
+            ColumnData::Time(col.into_iter().map(|c| c.and_then(|v| serial_to_time_micros(&v))).collect())
+        }
+        Kind::Interval => {
+            ColumnData::Interval(col.into_iter().map(|c| c.and_then(|v| serial_to_interval(&v))).collect())
+        }
     }
 }
 
@@ -217,6 +244,12 @@ fn kind_of_field(f: &FieldHeader) -> Kind {
     }
     if has("$timestamp") {
         return Kind::Timestamp;
+    }
+    if has("$time") {
+        return Kind::Time;
+    }
+    if has("$interval") {
+        return Kind::Interval;
     }
     if has("$text") || has("$ascii") {
         return Kind::Text;
@@ -266,6 +299,23 @@ fn serial_to_days(v: &Value) -> Option<i32> {
 /// Numéro de série Qlik → microsecondes depuis l'époque DuckDB (pour `TIMESTAMP`).
 fn serial_to_micros(v: &Value) -> Option<i64> {
     value_as_f64(v).map(|s| ((s - QLIK_EPOCH_OFFSET_DAYS) * MICROS_PER_DAY).round() as i64)
+}
+
+/// Heure Qlik (fraction de jour) → microsecondes depuis minuit (pour `TIME`).
+fn serial_to_time_micros(v: &Value) -> Option<i64> {
+    value_as_f64(v).map(|s| {
+        let frac = s - s.floor(); // partie fractionnaire ∈ [0, 1)
+        (frac * MICROS_PER_DAY).round() as i64
+    })
+}
+
+/// Durée Qlik (en jours, fractionnaire) → `INTERVAL` (mois/jours/µs).
+fn serial_to_interval(v: &Value) -> Option<IntervalVal> {
+    value_as_f64(v).map(|s| {
+        let days = s.trunc();
+        let micros = ((s - days) * MICROS_PER_DAY).round() as i64;
+        IntervalVal { months: 0, days: days as i32, micros }
+    })
 }
 
 fn value_to_string(v: Value) -> String {
@@ -443,6 +493,60 @@ mod tests {
         }
     }
 
+    /// Les tags `$time`/`$interval` donnent des colonnes `TIME`/`INTERVAL`.
+    #[test]
+    fn read_qvd_maps_time_and_interval() {
+        let cols = vec![
+            // 0.5 jour = 12:00:00 ; 0.25 = 06:00:00.
+            tagged(
+                "t",
+                vec![Some(Value::Float(0.5)), Some(Value::Float(0.25))],
+                &["$time"],
+            ),
+            // 1.5 jour = 1 jour + 12h ; 2.0 = 2 jours pile.
+            tagged(
+                "dur",
+                vec![Some(Value::Float(1.5)), Some(Value::Float(2.0))],
+                &["$interval"],
+            ),
+        ];
+        let path = write_temp("openqvd_time_interval.qvd", cols);
+        let data = read_all(&path);
+
+        assert!(matches!(data.type_ids[0], LogicalTypeId::Time));
+        assert!(matches!(data.type_ids[1], LogicalTypeId::Interval));
+
+        match &data.columns[0] {
+            ColumnData::Time(v) => {
+                assert_eq!(v, &[Some(12 * 3_600_000_000), Some(6 * 3_600_000_000)]);
+            }
+            _ => panic!("t devrait être Time"),
+        }
+        match &data.columns[1] {
+            ColumnData::Interval(v) => {
+                let a = v[0].unwrap();
+                assert_eq!((a.months, a.days, a.micros), (0, 1, 12 * 3_600_000_000));
+                let b = v[1].unwrap();
+                assert_eq!((b.months, b.days, b.micros), (0, 2, 0));
+            }
+            _ => panic!("dur devrait être Interval"),
+        }
+    }
+
+    /// Génère `/tmp/ti_sample.qvd` (tags $time/$interval) pour un test live :
+    /// `cargo test --lib -- --ignored gen_time_interval_file`.
+    #[test]
+    #[ignore]
+    fn gen_time_interval_file() {
+        let cols = vec![
+            tagged("etiquette", vec![Some(Value::Str("midi".into())), Some(Value::Str("matin".into()))], &["$text"]),
+            tagged("heure", vec![Some(Value::Float(0.5)), Some(Value::Float(0.25))], &["$time"]),
+            tagged("duree", vec![Some(Value::Float(1.5)), Some(Value::Float(2.0))], &["$interval"]),
+        ];
+        let bytes = WriteTable::new("ti", cols).unwrap().to_bytes().unwrap();
+        std::fs::write("/tmp/ti_sample.qvd", bytes).unwrap();
+    }
+
     fn type_name(c: &ColumnData) -> &'static str {
         match c {
             ColumnData::I64(_) => "BIGINT",
@@ -450,6 +554,8 @@ mod tests {
             ColumnData::Utf8(_) => "VARCHAR",
             ColumnData::Date(_) => "DATE",
             ColumnData::Timestamp(_) => "TIMESTAMP",
+            ColumnData::Time(_) => "TIME",
+            ColumnData::Interval(_) => "INTERVAL",
         }
     }
 
@@ -479,6 +585,13 @@ mod tests {
                 let days = us.div_euclid(86_400_000_000) as i32;
                 let rem = us.rem_euclid(86_400_000_000) / 1_000_000;
                 format!("{} {:02}:{:02}:{:02}", days_to_iso(days), rem / 3600, (rem % 3600) / 60, rem % 60)
+            }),
+            ColumnData::Time(v) => v[i].map_or("NULL".into(), |us| {
+                let s = us / 1_000_000;
+                format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+            }),
+            ColumnData::Interval(v) => v[i].map_or("NULL".into(), |iv| {
+                format!("{}mo {}d {}us", iv.months, iv.days, iv.micros)
             }),
         }
     }

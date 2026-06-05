@@ -33,6 +33,8 @@ balise `<Type>` :
 |------------------------------|-------------|
 | `$date`                      | `DATE`      |
 | `$timestamp` (sans `$date`)  | `TIMESTAMP` |
+| `$time`                      | `TIME`      |
+| `$interval`                  | `INTERVAL`  |
 | `$text` / `$ascii`           | `VARCHAR`   |
 | `$integer`                   | `BIGINT`    |
 | `$numeric` (sans `$integer`) | `DOUBLE`    |
@@ -97,7 +99,6 @@ Limites d'écriture :
 - Les colonnes projetées sont **matérialisées en mémoire** à l'`init` ; scan
   **mono-thread**. L'écriture accumule aussi toutes les lignes en mémoire.
 - Glob local uniquement (pas de système de fichiers DuckDB : ni httpfs ni S3).
-- Tags `$time`/`$interval` non encore mappés (TIME/INTERVAL) → numériques.
 
 ## Structure
 
@@ -162,7 +163,7 @@ Pour tester sur de vrais QVD : déposer des fichiers dans `test/data/` et adapte
 ## Feuille de route
 
 - [x] Lecture `read_qvd('fichier.qvd')` avec typage BIGINT/DOUBLE/VARCHAR + NULL.
-- [x] Types temporels natifs `DATE`/`TIMESTAMP` (conversion du numéro de série Qlik).
+- [x] Types temporels natifs `DATE`/`TIMESTAMP`/`TIME`/`INTERVAL` (séries Qlik converties).
 - [x] Projection pushdown via `from_path_projected` (seules les colonnes utiles décodées).
 - [x] Glob `read_qvd('data/*.qvd')` (lignes concaténées, résolution par nom).
 - [x] Écriture `COPY ... TO ... (FORMAT qvd)` (copy function FFI ; round-trip vérifié).

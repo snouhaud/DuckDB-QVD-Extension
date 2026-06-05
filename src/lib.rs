@@ -161,6 +161,35 @@ impl VTab for ReadQvdVTab {
                         }
                     }
                 }
+                // DuckDB TIME : physiquement un i64 (µs depuis minuit).
+                ColumnData::Time(data) => {
+                    {
+                        let slice = vector.as_mut_slice::<i64>();
+                        for i in 0..n {
+                            slice[i] = data[start + i].unwrap_or_default();
+                        }
+                    }
+                    for i in 0..n {
+                        if data[start + i].is_none() {
+                            vector.set_null(i);
+                        }
+                    }
+                }
+                // DuckDB INTERVAL : struct (mois i32, jours i32, µs i64).
+                ColumnData::Interval(data) => {
+                    {
+                        let slice = vector.as_mut_slice::<qvd::IntervalVal>();
+                        for i in 0..n {
+                            slice[i] = data[start + i]
+                                .unwrap_or(qvd::IntervalVal { months: 0, days: 0, micros: 0 });
+                        }
+                    }
+                    for i in 0..n {
+                        if data[start + i].is_none() {
+                            vector.set_null(i);
+                        }
+                    }
+                }
             }
         }
 
