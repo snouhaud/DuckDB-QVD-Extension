@@ -22,10 +22,11 @@ use qvd::{ColumnData, Kind};
 /// Taille standard d'un vecteur DuckDB : nombre max de lignes par `func`.
 const VECTOR_SIZE: usize = 2048;
 
-/// Données produites par `bind` : le schéma complet (sans données). La lecture
-/// effective n'a lieu qu'à l'`init`, en ne décodant que les colonnes projetées.
+/// Données produites par `bind` : la liste des fichiers (glob déployé) et le
+/// schéma complet (sans données). La lecture effective n'a lieu qu'à l'`init`,
+/// en ne décodant que les colonnes projetées.
 struct ReadQvdBindData {
-    path: String,
+    paths: Vec<String>,
     names: Vec<String>,
     kinds: Vec<Kind>,
 }
@@ -50,26 +51,29 @@ impl VTab for ReadQvdVTab {
         true
     }
 
-    /// Lit le schéma (en-tête seul) et déclare une colonne DuckDB par champ.
+    /// Déploie le motif (glob), lit le schéma du premier fichier (en-tête seul)
+    /// et déclare une colonne DuckDB par champ.
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        let path = bind.get_parameter(0).to_string();
+        let pattern = bind.get_parameter(0).to_string();
+        let paths = expand_glob(&pattern)?;
 
-        let schema = qvd::read_schema(&path)?;
+        let schema = qvd::read_schema(&paths[0])?;
         for (name, type_id) in schema.names.iter().zip(schema.type_ids.into_iter()) {
             bind.add_result_column(name.as_str(), LogicalTypeHandle::from(type_id));
         }
 
-        Ok(ReadQvdBindData { path, names: schema.names, kinds: schema.kinds })
+        Ok(ReadQvdBindData { paths, names: schema.names, kinds: schema.kinds })
     }
 
-    /// Décode uniquement les colonnes projetées par DuckDB.
+    /// Décode uniquement les colonnes projetées par DuckDB, sur tous les
+    /// fichiers du glob (lignes concaténées).
     fn init(info: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
         let bind = unsafe { &*info.get_bind_data::<ReadQvdBindData>() };
         let indices: Vec<usize> =
             info.get_column_indices().into_iter().map(|i| i as usize).collect();
 
         let (columns, num_rows) =
-            qvd::read_projected(&bind.path, &bind.names, &bind.kinds, &indices)?;
+            qvd::read_projected(&bind.paths, &bind.names, &bind.kinds, &indices)?;
 
         Ok(ReadQvdInitData { columns, num_rows, cursor: AtomicUsize::new(0) })
     }
@@ -168,6 +172,20 @@ impl VTab for ReadQvdVTab {
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
         Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
     }
+}
+
+/// Déploie un motif glob en liste de fichiers triée. Un chemin littéral sans
+/// métacaractère se résout en lui-même (s'il existe). Erreur si aucun match.
+fn expand_glob(pattern: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut paths = Vec::new();
+    for entry in glob::glob(pattern)? {
+        paths.push(entry?.to_string_lossy().into_owned());
+    }
+    paths.sort();
+    if paths.is_empty() {
+        return Err(format!("aucun fichier ne correspond au motif '{pattern}'").into());
+    }
+    Ok(paths)
 }
 
 #[duckdb_entrypoint_c_api()]

@@ -49,13 +49,24 @@ seules celles-ci sont décodées via `Qvd::from_path_projected`. Le `bind` ne li
 que l'en-tête ; le décodage des données a lieu à l'`init`, restreint aux colonnes
 projetées. `SELECT count(*)` ne décode aucune colonne.
 
+### Glob multi-fichiers
+
+```sql
+SELECT * FROM read_qvd('data/ventes_*.qvd');
+```
+
+Le motif est déployé (trié) et les lignes de tous les fichiers sont
+**concaténées**. Le schéma est celui du **premier fichier** ; dans chaque fichier
+les champs sont résolus **par nom** (robuste aux écarts d'ordre des colonnes), un
+champ absent ressortant en `NULL`. Un motif sans correspondance lève une erreur.
+
 ### Limitations connues (améliorations futures)
 
 - Typage piloté par les tags Qlik ; un QVD sans tags retombe sur `<Type>` puis
   `VARCHAR` par défaut (les fichiers produits par Qlik sont toujours taggés).
 - Les colonnes projetées sont **matérialisées en mémoire** à l'`init` ; scan
   **mono-thread**.
-- Pas encore de glob `read_qvd('*.qvd')`.
+- Glob local uniquement (pas de système de fichiers DuckDB : ni httpfs ni S3).
 - Écriture (`COPY ... TO ... (FORMAT qvd)`) non implémentée.
 - Tags `$time`/`$interval` non encore mappés (TIME/INTERVAL) → numériques.
 
@@ -124,7 +135,7 @@ Pour tester sur de vrais QVD : déposer des fichiers dans `test/data/` et adapte
 - [x] Lecture `read_qvd('fichier.qvd')` avec typage BIGINT/DOUBLE/VARCHAR + NULL.
 - [x] Types temporels natifs `DATE`/`TIMESTAMP` (conversion du numéro de série Qlik).
 - [x] Projection pushdown via `from_path_projected` (seules les colonnes utiles décodées).
-- [ ] Glob `read_qvd('data/*.qvd')`.
+- [x] Glob `read_qvd('data/*.qvd')` (lignes concaténées, résolution par nom).
 - [ ] Écriture `COPY ... TO ... (FORMAT qvd)` (dépend de l'état de l'API copy C).
 
 ## Licence

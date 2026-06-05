@@ -106,37 +106,92 @@ pub(crate) fn read_schema(path: &str) -> Result<Schema, Box<dyn Error>> {
 }
 
 /// Décode et matérialise uniquement les colonnes désignées par `indices`
-/// (positions dans le schéma complet), dans cet ordre — c'est le cœur de la
-/// projection pushdown. `kinds` est le typage complet issu de [`read_schema`].
+/// (positions dans le schéma de référence), dans cet ordre — projection
+/// pushdown — pour **tous** les `paths` du glob, lignes concaténées.
 ///
-/// Renvoie les colonnes (dans l'ordre de `indices`) et le nombre de lignes.
+/// `names`/`kinds` sont le schéma de référence (premier fichier) issu de
+/// [`read_schema`]. Renvoie les colonnes (ordre de `indices`) et le total de
+/// lignes sur l'ensemble des fichiers.
 pub(crate) fn read_projected(
-    path: &str,
+    paths: &[String],
     names: &[String],
     kinds: &[Kind],
     indices: &[usize],
 ) -> Result<(Vec<ColumnData>, usize), Box<dyn Error>> {
-    // Noms des seuls champs demandés → OpenQVD ne décode que ceux-là.
-    let needed: Vec<&str> = indices.iter().map(|&i| names[i].as_str()).collect();
-    let qvd = Qvd::from_path_projected(path, &needed)?;
+    // Colonnes demandées (nom + type), dérivées du schéma de référence.
+    let needed_names: Vec<&str> = indices.iter().map(|&i| names[i].as_str()).collect();
+    let needed_kinds: Vec<Kind> = indices.iter().map(|&i| kinds[i]).collect();
+
+    // Accumulateur (une colonne vide par champ projeté) que l'on étend fichier
+    // après fichier — c'est l'union (concaténation des lignes) du glob.
+    let mut columns: Vec<ColumnData> = needed_kinds.iter().map(|&k| empty_column(k)).collect();
+    let mut total = 0usize;
+    for path in paths {
+        let (cols, n) = read_one(path, &needed_names, &needed_kinds)?;
+        for (dst, src) in columns.iter_mut().zip(cols) {
+            append(dst, src);
+        }
+        total += n;
+    }
+    Ok((columns, total))
+}
+
+/// Lit les colonnes projetées d'UN fichier. Les champs sont résolus **par nom**
+/// (robuste aux écarts d'ordre entre fichiers d'un glob) ; un champ absent du
+/// fichier ressort entièrement `NULL`.
+fn read_one(
+    path: &str,
+    needed_names: &[&str],
+    needed_kinds: &[Kind],
+) -> Result<(Vec<ColumnData>, usize), Box<dyn Error>> {
+    let qvd = Qvd::from_path_projected(path, needed_names)?;
     let num_rows = qvd.num_rows() as usize;
 
+    // Position de chaque champ demandé dans CE fichier (None si absent).
+    let fields = qvd.fields();
+    let positions: Vec<Option<usize>> = needed_names
+        .iter()
+        .map(|name| fields.iter().position(|f| f.name == *name))
+        .collect();
+
     // `rows()` (non vérifié) : les colonnes non projetées ont une table de
-    // symboles vide et ressortent en `None` — d'où l'usage de `rows()` plutôt
-    // que `checked_rows()`, qui rejetterait ces index volontairement absents.
-    let mut raw: Vec<Vec<Option<Value>>> = (0..indices.len()).map(|_| Vec::new()).collect();
+    // symboles vide et ressortent en `None` — `checked_rows()` les rejetterait.
+    let mut raw: Vec<Vec<Option<Value>>> = (0..needed_names.len()).map(|_| Vec::new()).collect();
     for row in qvd.rows() {
-        for (k, &orig) in indices.iter().enumerate() {
-            raw[k].push(row.get(orig).cloned().flatten());
+        for (k, pos) in positions.iter().enumerate() {
+            raw[k].push(pos.and_then(|p| row.get(p).cloned().flatten()));
         }
     }
 
     let columns = raw
         .into_iter()
-        .enumerate()
-        .map(|(k, col)| materialize(col, kinds[indices[k]]))
+        .zip(needed_kinds)
+        .map(|(col, &k)| materialize(col, k))
         .collect();
     Ok((columns, num_rows))
+}
+
+/// Colonne typée vide (pour amorcer l'accumulateur du glob).
+fn empty_column(kind: Kind) -> ColumnData {
+    match kind {
+        Kind::Int => ColumnData::I64(Vec::new()),
+        Kind::Float => ColumnData::F64(Vec::new()),
+        Kind::Text => ColumnData::Utf8(Vec::new()),
+        Kind::Date => ColumnData::Date(Vec::new()),
+        Kind::Timestamp => ColumnData::Timestamp(Vec::new()),
+    }
+}
+
+/// Concatène `src` à la fin de `dst` (mêmes `Kind` par construction).
+fn append(dst: &mut ColumnData, src: ColumnData) {
+    match (dst, src) {
+        (ColumnData::I64(a), ColumnData::I64(b)) => a.extend(b),
+        (ColumnData::F64(a), ColumnData::F64(b)) => a.extend(b),
+        (ColumnData::Utf8(a), ColumnData::Utf8(b)) => a.extend(b),
+        (ColumnData::Date(a), ColumnData::Date(b)) => a.extend(b),
+        (ColumnData::Timestamp(a), ColumnData::Timestamp(b)) => a.extend(b),
+        _ => unreachable!("types de colonnes cohérents entre fichiers du glob"),
+    }
 }
 
 /// Convertit une colonne de `Value` bruts en colonne typée DuckDB.
@@ -248,7 +303,8 @@ mod tests {
     fn read_all(path: &str) -> QvdData {
         let s = read_schema(path).unwrap();
         let indices: Vec<usize> = (0..s.names.len()).collect();
-        let (columns, num_rows) = read_projected(path, &s.names, &s.kinds, &indices).unwrap();
+        let paths = [path.to_string()];
+        let (columns, num_rows) = read_projected(&paths, &s.names, &s.kinds, &indices).unwrap();
         QvdData { names: s.names, type_ids: s.type_ids, columns, num_rows }
     }
 
@@ -337,7 +393,8 @@ mod tests {
         assert_eq!(s.names, ["a", "b", "c"]);
 
         // Projeter c puis a (ordre inversé, b exclue).
-        let (columns, num_rows) = read_projected(&path, &s.names, &s.kinds, &[2, 0]).unwrap();
+        let paths = [path];
+        let (columns, num_rows) = read_projected(&paths, &s.names, &s.kinds, &[2, 0]).unwrap();
         assert_eq!(num_rows, 2);
         assert_eq!(columns.len(), 2);
         match &columns[0] {
@@ -347,6 +404,42 @@ mod tests {
         match &columns[1] {
             ColumnData::I64(v) => assert_eq!(v, &[Some(1), Some(2)]),
             _ => panic!("position 1 devrait être la colonne a (BIGINT)"),
+        }
+    }
+
+    /// Plusieurs fichiers (glob) : les lignes sont concaténées, et un champ
+    /// résolu par nom même si l'ordre des colonnes diffère entre fichiers.
+    #[test]
+    fn multi_file_concatenates_rows() {
+        let f1 = vec![
+            tagged("id", vec![Some(Value::Int(1)), Some(Value::Int(2))], &["$integer"]),
+            tagged("name", vec![Some(Value::Str("a".into())), Some(Value::Str("b".into()))], &["$text"]),
+        ];
+        // Deuxième fichier : colonnes dans l'ordre inverse (name puis id).
+        let f2 = vec![
+            tagged("name", vec![Some(Value::Str("c".into()))], &["$text"]),
+            tagged("id", vec![Some(Value::Int(3))], &["$integer"]),
+        ];
+        let p1 = write_temp("openqvd_multi_1.qvd", f1);
+        let p2 = write_temp("openqvd_multi_2.qvd", f2);
+
+        // Schéma de référence = premier fichier (id, name).
+        let s = read_schema(&p1).unwrap();
+        let indices: Vec<usize> = (0..s.names.len()).collect();
+        let paths = [p1, p2];
+        let (columns, n) = read_projected(&paths, &s.names, &s.kinds, &indices).unwrap();
+
+        assert_eq!(n, 3);
+        match &columns[0] {
+            ColumnData::I64(v) => assert_eq!(v, &[Some(1), Some(2), Some(3)]),
+            _ => panic!("id devrait être I64"),
+        }
+        match &columns[1] {
+            ColumnData::Utf8(v) => assert_eq!(
+                v,
+                &[Some("a".to_string()), Some("b".to_string()), Some("c".to_string())]
+            ),
+            _ => panic!("name devrait être Utf8"),
         }
     }
 

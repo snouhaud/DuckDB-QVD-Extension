@@ -27,3 +27,6 @@ duckdb = { version = "=1.10502.0", features = ["loadable-extension"] }
 
 # Lecteur/décodeur du format QVD (API décodée, sans la feature "arrow").
 openqvd = "1"
+
+# Expansion des motifs glob (read_qvd('data/*.qvd')).
+glob = "0.3"
