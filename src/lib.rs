@@ -1,8 +1,8 @@
 //! Extension DuckDB `qvd` — expose la table function `read_qvd('fichier.qvd')`.
 //!
 //! `lib.rs` porte la plomberie DuckDB (enregistrement de la fonction, cycle
-//! bind/init/func). La lecture et le typage du format QVD sont délégués à
-//! [`mod@qvd`], qui s'appuie sur le crate OpenQVD.
+//! bind/init/func). La lecture (streaming) et le typage du format QVD sont
+//! délégués à [`mod@qvd`] (crate `qvdrs`) ; l'écriture à [`mod@copy`] (OpenQVD).
 
 mod copy;
 mod copy_from;
@@ -14,37 +14,23 @@ use duckdb::{
     vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
     Connection, Result,
 };
-use std::{
-    error::Error,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::error::Error;
 
-use qvd::{ColumnData, Kind};
-
-/// Taille standard d'un vecteur DuckDB : nombre max de lignes par `func`.
-const VECTOR_SIZE: usize = 2048;
+use qvd::{Cell, Kind, Pull, QvdScan};
 
 /// Données produites par `bind` : la liste des fichiers (glob déployé) et le
-/// schéma complet (sans données). La lecture effective n'a lieu qu'à l'`init`,
-/// en ne décodant que les colonnes projetées.
+/// schéma complet (sans données). La lecture effective (streaming) n'a lieu
+/// qu'à l'`init`/`func`, en ne décodant que les colonnes projetées.
 struct ReadQvdBindData {
     paths: Vec<String>,
     names: Vec<String>,
     kinds: Vec<Kind>,
 }
 
-/// État d'un scan : colonnes projetées (ordre de sortie), nombre de lignes et
-/// curseur courant.
-struct ReadQvdInitData {
-    columns: Vec<ColumnData>,
-    num_rows: usize,
-    cursor: AtomicUsize,
-}
-
 struct ReadQvdVTab;
 
 impl VTab for ReadQvdVTab {
-    type InitData = ReadQvdInitData;
+    type InitData = QvdScan;
     type BindData = ReadQvdBindData;
 
     /// Active la projection pushdown : DuckDB indiquera à l'`init` les seules
@@ -67,141 +53,108 @@ impl VTab for ReadQvdVTab {
         Ok(ReadQvdBindData { paths, names: schema.names, kinds: schema.kinds })
     }
 
-    /// Décode uniquement les colonnes projetées par DuckDB, sur tous les
-    /// fichiers du glob (lignes concaténées).
+    /// Prépare le scan streaming (aucun décodage de l'index ici).
     fn init(info: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
         let bind = unsafe { &*info.get_bind_data::<ReadQvdBindData>() };
         let indices: Vec<usize> =
             info.get_column_indices().into_iter().map(|i| i as usize).collect();
-
-        let (columns, num_rows) =
-            qvd::read_projected(&bind.paths, &bind.names, &bind.kinds, &indices)?;
-
-        Ok(ReadQvdInitData { columns, num_rows, cursor: AtomicUsize::new(0) })
+        QvdScan::new(&bind.paths, &bind.names, &bind.kinds, &indices)
     }
 
-    /// Émet un paquet de lignes (jusqu'à `VECTOR_SIZE`) à chaque appel, jusqu'à
-    /// épuisement (`set_len(0)`).
+    /// Tire un chunk du scan streaming et le copie dans la sortie DuckDB.
     fn func(
         func: &TableFunctionInfo<Self>,
         output: &mut DataChunkHandle,
     ) -> Result<(), Box<dyn Error>> {
-        let init_data = func.get_init_data();
-
-        let start = init_data.cursor.load(Ordering::Relaxed);
-        if start >= init_data.num_rows {
-            output.set_len(0);
-            return Ok(());
-        }
-        let n = (init_data.num_rows - start).min(VECTOR_SIZE);
-
-        for (j, column) in init_data.columns.iter().enumerate() {
-            let mut vector = output.flat_vector(j);
-            match column {
-                ColumnData::I64(data) => {
-                    {
-                        // Le vecteur est dimensionné pour VECTOR_SIZE lignes ;
-                        // on n'écrit que les indices 0..n.
-                        let slice = vector.as_mut_slice::<i64>();
-                        for i in 0..n {
-                            slice[i] = data[start + i].unwrap_or_default();
-                        }
-                    }
-                    for i in 0..n {
-                        if data[start + i].is_none() {
-                            vector.set_null(i);
-                        }
-                    }
+        let scan = func.get_init_data();
+        match scan.pull()? {
+            Pull::Done => output.set_len(0),
+            Pull::Rows(n) => output.set_len(n), // COUNT(*) : lignes sans colonnes
+            Pull::Chunk { positions, chunk } => {
+                let kinds = scan.output_kinds();
+                let n = chunk.num_rows;
+                for (j, &kind) in kinds.iter().enumerate() {
+                    let src = positions[j].map(|p| &chunk.columns[p]);
+                    let cells: Vec<Cell> = (0..n)
+                        .map(|r| match src {
+                            Some(c) => qvd::convert(kind, &c[r]),
+                            None => Cell::Null,
+                        })
+                        .collect();
+                    write_column(output, j, kind, &cells);
                 }
-                ColumnData::F64(data) => {
-                    {
-                        let slice = vector.as_mut_slice::<f64>();
-                        for i in 0..n {
-                            slice[i] = data[start + i].unwrap_or_default();
-                        }
-                    }
-                    for i in 0..n {
-                        if data[start + i].is_none() {
-                            vector.set_null(i);
-                        }
-                    }
-                }
-                ColumnData::Utf8(data) => {
-                    for i in 0..n {
-                        match &data[start + i] {
-                            Some(s) => vector.insert(i, s.as_str()),
-                            None => vector.set_null(i),
-                        }
-                    }
-                }
-                // DuckDB DATE : physiquement un i32 (jours depuis 1970-01-01).
-                ColumnData::Date(data) => {
-                    {
-                        let slice = vector.as_mut_slice::<i32>();
-                        for i in 0..n {
-                            slice[i] = data[start + i].unwrap_or_default();
-                        }
-                    }
-                    for i in 0..n {
-                        if data[start + i].is_none() {
-                            vector.set_null(i);
-                        }
-                    }
-                }
-                // DuckDB TIMESTAMP : physiquement un i64 (µs depuis 1970-01-01).
-                ColumnData::Timestamp(data) => {
-                    {
-                        let slice = vector.as_mut_slice::<i64>();
-                        for i in 0..n {
-                            slice[i] = data[start + i].unwrap_or_default();
-                        }
-                    }
-                    for i in 0..n {
-                        if data[start + i].is_none() {
-                            vector.set_null(i);
-                        }
-                    }
-                }
-                // DuckDB TIME : physiquement un i64 (µs depuis minuit).
-                ColumnData::Time(data) => {
-                    {
-                        let slice = vector.as_mut_slice::<i64>();
-                        for i in 0..n {
-                            slice[i] = data[start + i].unwrap_or_default();
-                        }
-                    }
-                    for i in 0..n {
-                        if data[start + i].is_none() {
-                            vector.set_null(i);
-                        }
-                    }
-                }
-                // DuckDB INTERVAL : struct (mois i32, jours i32, µs i64).
-                ColumnData::Interval(data) => {
-                    {
-                        let slice = vector.as_mut_slice::<qvd::IntervalVal>();
-                        for i in 0..n {
-                            slice[i] = data[start + i]
-                                .unwrap_or(qvd::IntervalVal { months: 0, days: 0, micros: 0 });
-                        }
-                    }
-                    for i in 0..n {
-                        if data[start + i].is_none() {
-                            vector.set_null(i);
-                        }
-                    }
-                }
+                output.set_len(n);
             }
         }
-
-        init_data.cursor.store(start + n, Ordering::Relaxed);
-        output.set_len(n);
         Ok(())
     }
 
     /// Paramètres positionnels : `read_qvd(VARCHAR)`.
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
         Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
+    }
+}
+
+/// Écrit une colonne de `Cell` (déjà convertis) dans le FlatVector `j`.
+/// Pour les types primitifs : écrit le slice puis pose les bits NULL.
+fn write_column(output: &mut DataChunkHandle, j: usize, kind: Kind, cells: &[Cell]) {
+    let mut v = output.flat_vector(j);
+    match kind {
+        Kind::Text => {
+            for (r, c) in cells.iter().enumerate() {
+                match c {
+                    Cell::Str(s) => v.insert(r, s.as_str()),
+                    _ => v.set_null(r),
+                }
+            }
+        }
+        Kind::Int | Kind::Timestamp | Kind::Time => {
+            {
+                let s = v.as_mut_slice::<i64>();
+                for (r, c) in cells.iter().enumerate() {
+                    s[r] = if let Cell::I64(x) = c { *x } else { 0 };
+                }
+            }
+            set_nulls(&mut v, cells);
+        }
+        Kind::Float => {
+            {
+                let s = v.as_mut_slice::<f64>();
+                for (r, c) in cells.iter().enumerate() {
+                    s[r] = if let Cell::F64(x) = c { *x } else { 0.0 };
+                }
+            }
+            set_nulls(&mut v, cells);
+        }
+        Kind::Date => {
+            {
+                let s = v.as_mut_slice::<i32>();
+                for (r, c) in cells.iter().enumerate() {
+                    s[r] = if let Cell::I32(x) = c { *x } else { 0 };
+                }
+            }
+            set_nulls(&mut v, cells);
+        }
+        Kind::Interval => {
+            {
+                let s = v.as_mut_slice::<qvd::IntervalVal>();
+                for (r, c) in cells.iter().enumerate() {
+                    s[r] = match c {
+                        Cell::Interval(x) => *x,
+                        _ => qvd::IntervalVal { months: 0, days: 0, micros: 0 },
+                    };
+                }
+            }
+            set_nulls(&mut v, cells);
+        }
+    }
+}
+
+fn set_nulls(v: &mut duckdb::core::FlatVector, cells: &[Cell]) {
+    for (r, c) in cells.iter().enumerate() {
+        if matches!(c, Cell::Null) {
+            v.set_null(r);
+        }
     }
 }
 

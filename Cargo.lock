@@ -1168,6 +1168,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "napi-build"
+version = "2.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9c366d2c8c60b86fa632df75f745509b52f9128f91a6bad4c796e44abb505e1"
+
+[[package]]
 name = "num-bigint"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1409,6 +1415,16 @@ dependencies = [
  "duckdb",
  "glob",
  "openqvd",
+ "qvd 0.7.1",
+]
+
+[[package]]
+name = "qvd"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8272684d9dce6b8fd98c32fe6dfb79454bed26a7ca86321866ad07e34b5fb048"
+dependencies = [
+ "napi-build",
 ]
 
 [[package]]

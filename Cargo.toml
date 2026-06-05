@@ -25,7 +25,11 @@ crate-type = ["staticlib"]
 # Plomberie de l'extension DuckDB (table functions, VTab, entrypoint C-API).
 duckdb = { version = "=1.10502.0", features = ["loadable-extension"] }
 
-# Lecteur/décodeur du format QVD (API décodée, sans la feature "arrow").
+# Lecture QVD : reader streaming à mémoire bornée (open_qvd_stream/next_chunk).
+# Renommé pour éviter la collision avec le nom de package "qvd" ci-dessus.
+qvdrs = { package = "qvd", version = "0.7" }
+
+# Écriture QVD : writer avec contrôle fin des tags/valeurs (utilisé par COPY TO).
 openqvd = "1"
 
 # Expansion des motifs glob (read_qvd('data/*.qvd')).

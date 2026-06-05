@@ -1,8 +1,9 @@
 # Extension DuckDB `qvd` — `read_qvd()` / `COPY TO (FORMAT qvd)`
 
 Extension DuckDB **100 % Rust** pour **lire et écrire** les fichiers Qlik
-**QVD**, en s'appuyant sur le crate
-[OpenQVD](https://github.com/Sigilweaver/OpenQVD).
+**QVD**. La **lecture** s'appuie sur [`qvd` (qvdrs)](https://github.com/bintocher/qvdrs)
+(reader **streaming** à mémoire bornée) ; l'**écriture** sur
+[OpenQVD](https://github.com/Sigilweaver/OpenQVD) (contrôle fin des tags).
 
 ```sql
 SELECT * FROM read_qvd('ventes.qvd');
@@ -13,12 +14,14 @@ COPY ventes FROM 'sortie.qvd' (FORMAT qvd);
 ## État du projet
 
 **Lecture fonctionnelle, vérifiée en DuckDB live (v1.5.3).** L'extension
-s'enregistre, déclare la table function `read_qvd(VARCHAR)` et lit réellement les
-fichiers QVD via OpenQVD : ouverture du fichier, déduction d'un type DuckDB par
-champ, et streaming des lignes par paquets de 2048 vers DuckDB. Les colonnes
-`DATE`/`BIGINT`/`VARCHAR` se comportent comme de vrais types SQL (filtres,
-`EXTRACT`, agrégats). La logique est isolée dans [`src/qvd.rs`](src/qvd.rs) et
-couverte par un test d'intégration (`cargo test --lib`).
+s'enregistre, déclare la table function `read_qvd(VARCHAR)` et lit les fichiers
+QVD en **streaming** via `qvdrs` : déduction d'un type DuckDB par champ (au
+`bind`), puis décodage **par chunks de 2048 lignes** (`open_qvd_stream`/
+`next_chunk`), un fichier ouvert à la fois. La mémoire est **bornée** (≈ tables de
+symboles + un chunk), indépendamment du nombre de lignes — plus de matérialisation
+de toutes les lignes. Les colonnes `DATE`/`BIGINT`/`VARCHAR` se comportent comme de
+vrais types SQL (filtres, `EXTRACT`, agrégats). La logique est isolée dans
+[`src/qvd.rs`](src/qvd.rs) et couverte par des tests (`cargo test --lib`).
 
 ```sql
 SELECT id, price FROM read_qvd('ventes.qvd') WHERE price > 100;
@@ -115,8 +118,11 @@ les `NULL` sont restitués ; round-trip `COPY TO` → `COPY FROM` vérifié.
 
 - Typage piloté par les tags Qlik ; un QVD sans tags retombe sur `<Type>` puis
   `VARCHAR` par défaut (les fichiers produits par Qlik sont toujours taggés).
-- Les colonnes projetées sont **matérialisées en mémoire** à l'`init` ; scan
-  **mono-thread**. L'écriture accumule aussi toutes les lignes en mémoire.
+- **Lecture en streaming à mémoire bornée** (≈ tables de symboles + un chunk).
+  En revanche `qvdrs` décode **toutes** les tables de symboles du fichier (pas de
+  projection au niveau symboles) ; la projection s'applique à l'émission.
+- L'**écriture** (`COPY TO`) accumule encore toutes les lignes en mémoire (writer
+  OpenQVD).
 - Glob local uniquement (pas de système de fichiers DuckDB : ni httpfs ni S3).
 
 ## Structure
@@ -124,7 +130,7 @@ les `NULL` sont restitués ; round-trip `COPY TO` → `COPY FROM` vérifié.
 | Fichier | Rôle |
 |---|---|
 | `src/lib.rs` | Entrypoint C-API + VTab `read_qvd` (plomberie DuckDB, streaming) |
-| `src/qvd.rs` | Intégration OpenQVD : lecture, typage, conversion + test d'intégration |
+| `src/qvd.rs` | Lecture streaming `qvdrs` : schéma, typage, scan par chunks, conversions + tests |
 | `src/wasm_lib.rs` | Réexport pour la cible Wasm (staticlib) |
 | `Cargo.toml` | Dépendances (`duckdb`, + `openqvd`/`arrow` à activer) |
 | `Makefile` | Build C-API (`make debug`/`release`) + cibles cargo rapides |
