@@ -84,8 +84,8 @@ impl Kind {
 
 /// Décalage entre l'époque des numéros de série Qlik (1899-12-30) et celle de
 /// DuckDB (1970-01-01), en jours.
-const QLIK_EPOCH_OFFSET_DAYS: f64 = 25569.0;
-const MICROS_PER_DAY: f64 = 86_400_000_000.0;
+pub(crate) const QLIK_EPOCH_OFFSET_DAYS: f64 = 25569.0;
+pub(crate) const MICROS_PER_DAY: f64 = 86_400_000_000.0;
 
 /// Lit uniquement le schéma (en-tête) d'un QVD, sans décoder les données.
 ///

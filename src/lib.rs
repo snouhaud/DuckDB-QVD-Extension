@@ -4,11 +4,12 @@
 //! bind/init/func). La lecture et le typage du format QVD sont délégués à
 //! [`mod@qvd`], qui s'appuie sur le crate OpenQVD.
 
+mod copy;
 mod qvd;
 
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
-    duckdb_entrypoint_c_api,
+    ffi,
     vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
     Connection, Result,
 };
@@ -188,9 +189,65 @@ fn expand_glob(pattern: &str) -> Result<Vec<String>, Box<dyn Error>> {
     Ok(paths)
 }
 
-#[duckdb_entrypoint_c_api()]
-pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
-    con.register_table_function::<ReadQvdVTab>("read_qvd")
-        .expect("Échec de l'enregistrement de la table function read_qvd");
-    Ok(())
+/// Enregistre la table function `read_qvd` et la copy function `qvd`.
+///
+/// On n'utilise pas la macro `duckdb_entrypoint_c_api` car la copy function
+/// (non wrappée par duckdb-rs) requiert le `duckdb_connection` brut, que la
+/// `Connection` de la macro n'expose pas. On reproduit donc sa logique :
+/// init de l'API C, récupération de la database, puis enregistrements.
+unsafe fn init_internal(
+    info: ffi::duckdb_extension_info,
+    access: *const ffi::duckdb_extension_access,
+) -> Result<bool, Box<dyn Error>> {
+    let version = option_env!("DUCKDB_EXTENSION_MIN_DUCKDB_VERSION").unwrap_or("dev");
+    if !ffi::duckdb_rs_extension_api_init(info, access, version)? {
+        return Ok(false); // incompatibilité de version d'API
+    }
+
+    let get_database = (*access)
+        .get_database
+        .ok_or("get_database est null dans duckdb_extension_access")?;
+    let db_ptr = get_database(info);
+    if db_ptr.is_null() {
+        return Ok(false);
+    }
+    let database: ffi::duckdb_database = *db_ptr;
+
+    // Table function via l'API haut niveau de duckdb-rs.
+    let connection = Connection::open_from_raw(database.cast())?;
+    connection.register_table_function::<ReadQvdVTab>("read_qvd")?;
+
+    // Copy function via FFI brut, sur une connexion dédiée (l'enregistrement
+    // persiste au niveau de la base).
+    let mut con: ffi::duckdb_connection = std::ptr::null_mut();
+    if ffi::duckdb_connect(database, &mut con) != ffi::duckdb_state_DuckDBSuccess {
+        return Err("duckdb_connect a échoué".into());
+    }
+    let res = copy::register(con);
+    ffi::duckdb_disconnect(&mut con);
+    res?;
+
+    Ok(true)
+}
+
+/// Point d'entrée C appelé par DuckDB au chargement de l'extension.
+///
+/// # Safety
+/// Appelé par DuckDB avec des pointeurs valides.
+#[no_mangle]
+pub unsafe extern "C" fn qvd_init_c_api(
+    info: ffi::duckdb_extension_info,
+    access: *const ffi::duckdb_extension_access,
+) -> bool {
+    match init_internal(info, access) {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(set_error) = (*access).set_error {
+                if let Ok(c) = std::ffi::CString::new(e.to_string()) {
+                    set_error(info, c.as_ptr());
+                }
+            }
+            false
+        }
+    }
 }

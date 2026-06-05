@@ -1,12 +1,12 @@
-# Extension DuckDB `qvd` — `read_qvd()`
+# Extension DuckDB `qvd` — `read_qvd()` / `COPY TO (FORMAT qvd)`
 
-Extension DuckDB **100 % Rust** exposant une table function pour lire les
-fichiers Qlik **QVD**, en s'appuyant sur le crate
-[OpenQVD](https://github.com/Sigilweaver/OpenQVD) (lecteur QVD mûr, sortie
-Arrow).
+Extension DuckDB **100 % Rust** pour **lire et écrire** les fichiers Qlik
+**QVD**, en s'appuyant sur le crate
+[OpenQVD](https://github.com/Sigilweaver/OpenQVD).
 
 ```sql
 SELECT * FROM read_qvd('ventes.qvd');
+COPY (SELECT * FROM ventes) TO 'sortie.qvd' (FORMAT qvd);
 ```
 
 ## État du projet
@@ -60,14 +60,32 @@ Le motif est déployé (trié) et les lignes de tous les fichiers sont
 les champs sont résolus **par nom** (robuste aux écarts d'ordre des colonnes), un
 champ absent ressortant en `NULL`. Un motif sans correspondance lève une erreur.
 
+### Écriture : `COPY ... TO ... (FORMAT qvd)`
+
+```sql
+COPY (SELECT id, montant, date_vente FROM ventes) TO 'export.qvd' (FORMAT qvd);
+```
+
+Implémentée via une **copy function** de l'API C (non wrappée par duckdb-rs,
+pilotée en FFI dans [`src/copy.rs`](src/copy.rs)) : `bind` (types) →
+`global_init` (chemin) → `sink` (accumulation) → `finalize` (écriture OpenQVD).
+Types préservés et taggés pour relecture (`BIGINT`/`DOUBLE`/`VARCHAR`/`DATE`/
+`TIMESTAMP`), `NULL` et UTF-8 conservés. Vérifié en round-trip `read_qvd` →
+`COPY` → `read_qvd`.
+
+Limites d'écriture :
+- **Noms de colonnes non préservés** → `field0`, `field1`, … (l'API C de la copy
+  function n'expose pas les noms ; à lever via une future option `FIELD_NAMES`).
+- Types lus : BOOLEAN/TINYINT/SMALLINT/INTEGER/BIGINT/FLOAT/DOUBLE/VARCHAR/DATE/
+  TIMESTAMP. Les autres (ex. `DECIMAL`, `HUGEINT`) exigent un `CAST`.
+
 ### Limitations connues (améliorations futures)
 
 - Typage piloté par les tags Qlik ; un QVD sans tags retombe sur `<Type>` puis
   `VARCHAR` par défaut (les fichiers produits par Qlik sont toujours taggés).
 - Les colonnes projetées sont **matérialisées en mémoire** à l'`init` ; scan
-  **mono-thread**.
+  **mono-thread**. L'écriture accumule aussi toutes les lignes en mémoire.
 - Glob local uniquement (pas de système de fichiers DuckDB : ni httpfs ni S3).
-- Écriture (`COPY ... TO ... (FORMAT qvd)`) non implémentée.
 - Tags `$time`/`$interval` non encore mappés (TIME/INTERVAL) → numériques.
 
 ## Structure
@@ -136,7 +154,9 @@ Pour tester sur de vrais QVD : déposer des fichiers dans `test/data/` et adapte
 - [x] Types temporels natifs `DATE`/`TIMESTAMP` (conversion du numéro de série Qlik).
 - [x] Projection pushdown via `from_path_projected` (seules les colonnes utiles décodées).
 - [x] Glob `read_qvd('data/*.qvd')` (lignes concaténées, résolution par nom).
-- [ ] Écriture `COPY ... TO ... (FORMAT qvd)` (dépend de l'état de l'API copy C).
+- [x] Écriture `COPY ... TO ... (FORMAT qvd)` (copy function FFI ; round-trip vérifié).
+- [ ] Préserver les noms de colonnes à l'écriture (option `FIELD_NAMES`).
+- [ ] Lecture `COPY ... FROM` / types `DECIMAL` à l'écriture.
 
 ## Licence
 
