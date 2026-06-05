@@ -7,3 +7,13 @@
 __pycache__/
 .DS_Store
 extension-ci-tools/
+
+# Jeux de données QVD volumineux (test mémoire/streaming) — non versionnés.
+QVD-Examples/Dest_airport.QVD
+QVD-Examples/Marketing_Airline.QVD
+QVD-Examples/Operating_Airline.QVD
+QVD-Examples/Origin_airport.QVD
+QVD-Examples/flights.QVD
+QVD-Examples/plane_registration_aircraft.QVD
+QVD-Examples/plane_registration_engine.QVD
+QVD-Examples/plane_registration_master.QVD
