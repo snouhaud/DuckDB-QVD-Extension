@@ -17,20 +17,24 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use qvd::{ColumnData, QvdData};
+use qvd::{ColumnData, Kind};
 
 /// Taille standard d'un vecteur DuckDB : nombre max de lignes par `func`.
 const VECTOR_SIZE: usize = 2048;
 
-/// Données produites par `bind` : le QVD entièrement matérialisé en colonnes
-/// typées, partagé en lecture par tous les appels de `func`.
+/// Données produites par `bind` : le schéma complet (sans données). La lecture
+/// effective n'a lieu qu'à l'`init`, en ne décodant que les colonnes projetées.
 struct ReadQvdBindData {
-    num_rows: usize,
-    columns: Vec<ColumnData>,
+    path: String,
+    names: Vec<String>,
+    kinds: Vec<Kind>,
 }
 
-/// État d'exécution du scan : curseur de ligne courant.
+/// État d'un scan : colonnes projetées (ordre de sortie), nombre de lignes et
+/// curseur courant.
 struct ReadQvdInitData {
+    columns: Vec<ColumnData>,
+    num_rows: usize,
     cursor: AtomicUsize,
 }
 
@@ -40,22 +44,34 @@ impl VTab for ReadQvdVTab {
     type InitData = ReadQvdInitData;
     type BindData = ReadQvdBindData;
 
-    /// Ouvre le fichier, déclare une colonne DuckDB par champ QVD et conserve
-    /// les données matérialisées pour `func`.
+    /// Active la projection pushdown : DuckDB indiquera à l'`init` les seules
+    /// colonnes nécessaires.
+    fn supports_pushdown() -> bool {
+        true
+    }
+
+    /// Lit le schéma (en-tête seul) et déclare une colonne DuckDB par champ.
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
         let path = bind.get_parameter(0).to_string();
 
-        let QvdData { names, type_ids, columns, num_rows } = qvd::read_qvd(&path)?;
-
-        for (name, type_id) in names.iter().zip(type_ids.into_iter()) {
+        let schema = qvd::read_schema(&path)?;
+        for (name, type_id) in schema.names.iter().zip(schema.type_ids.into_iter()) {
             bind.add_result_column(name.as_str(), LogicalTypeHandle::from(type_id));
         }
 
-        Ok(ReadQvdBindData { num_rows, columns })
+        Ok(ReadQvdBindData { path, names: schema.names, kinds: schema.kinds })
     }
 
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
-        Ok(ReadQvdInitData { cursor: AtomicUsize::new(0) })
+    /// Décode uniquement les colonnes projetées par DuckDB.
+    fn init(info: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
+        let bind = unsafe { &*info.get_bind_data::<ReadQvdBindData>() };
+        let indices: Vec<usize> =
+            info.get_column_indices().into_iter().map(|i| i as usize).collect();
+
+        let (columns, num_rows) =
+            qvd::read_projected(&bind.path, &bind.names, &bind.kinds, &indices)?;
+
+        Ok(ReadQvdInitData { columns, num_rows, cursor: AtomicUsize::new(0) })
     }
 
     /// Émet un paquet de lignes (jusqu'à `VECTOR_SIZE`) à chaque appel, jusqu'à
@@ -64,17 +80,16 @@ impl VTab for ReadQvdVTab {
         func: &TableFunctionInfo<Self>,
         output: &mut DataChunkHandle,
     ) -> Result<(), Box<dyn Error>> {
-        let bind_data = func.get_bind_data();
         let init_data = func.get_init_data();
 
         let start = init_data.cursor.load(Ordering::Relaxed);
-        if start >= bind_data.num_rows {
+        if start >= init_data.num_rows {
             output.set_len(0);
             return Ok(());
         }
-        let n = (bind_data.num_rows - start).min(VECTOR_SIZE);
+        let n = (init_data.num_rows - start).min(VECTOR_SIZE);
 
-        for (j, column) in bind_data.columns.iter().enumerate() {
+        for (j, column) in init_data.columns.iter().enumerate() {
             let mut vector = output.flat_vector(j);
             match column {
                 ColumnData::I64(data) => {

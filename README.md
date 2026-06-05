@@ -25,27 +25,37 @@ SELECT id, price FROM read_qvd('ventes.qvd') WHERE price > 100;
 
 ### Correspondance des types
 
-Le type DuckDB de chaque colonne est déduit des valeurs réellement décodées :
+Le type DuckDB est déduit des **tags Qlik** de l'en-tête (lus au `bind`, sans
+décoder les données — ce qui permet la projection pushdown), avec repli sur la
+balise `<Type>` :
 
-| Contenu de la colonne                      | Type DuckDB |
-|--------------------------------------------|-------------|
-| tag `$date`/`$timestamp`, série jour entier| `DATE`      |
-| tag `$date`/`$timestamp`, composante horaire| `TIMESTAMP` |
-| uniquement des entiers                     | `BIGINT`    |
-| au moins un flottant, aucun texte          | `DOUBLE`    |
-| au moins une chaîne                        | `VARCHAR`   |
+| Tag Qlik (repli `<Type>`)    | Type DuckDB |
+|------------------------------|-------------|
+| `$date`                      | `DATE`      |
+| `$timestamp` (sans `$date`)  | `TIMESTAMP` |
+| `$text` / `$ascii`           | `VARCHAR`   |
+| `$integer`                   | `BIGINT`    |
+| `$numeric` (sans `$integer`) | `DOUBLE`    |
 
-Les champs temporels sont détectés par les **tags Qlik** (`$date`/`$timestamp`),
-signal plus fiable que la balise `<Type>` (souvent `UNKNOWN`). Le numéro de série
-Qlik (époque 1899-12-30) est converti en `DATE`/`TIMESTAMP` natif DuckDB.
-Vérifié sur données réelles : série `33765` → `1992-06-10`. Les `NULL` sont
-préservés.
+Les tags sont un signal plus fiable que `<Type>` (souvent `UNKNOWN` même pour de
+vraies dates). Le numéro de série Qlik (époque 1899-12-30) est converti en
+`DATE`/`TIMESTAMP` natif. Vérifié sur données réelles : série `33765` →
+`1992-06-10`. Les `NULL` sont préservés.
+
+### Projection pushdown
+
+`supports_pushdown()` est activé : DuckDB ne demande que les colonnes utiles, et
+seules celles-ci sont décodées via `Qvd::from_path_projected`. Le `bind` ne lit
+que l'en-tête ; le décodage des données a lieu à l'`init`, restreint aux colonnes
+projetées. `SELECT count(*)` ne décode aucune colonne.
 
 ### Limitations connues (améliorations futures)
 
-- Le fichier est **entièrement matérialisé en mémoire** au moment du `bind`
-  (OpenQVD charge le QVD complet) ; scan **mono-thread**.
-- Pas encore de projection pushdown ni de glob `read_qvd('*.qvd')`.
+- Typage piloté par les tags Qlik ; un QVD sans tags retombe sur `<Type>` puis
+  `VARCHAR` par défaut (les fichiers produits par Qlik sont toujours taggés).
+- Les colonnes projetées sont **matérialisées en mémoire** à l'`init` ; scan
+  **mono-thread**.
+- Pas encore de glob `read_qvd('*.qvd')`.
 - Écriture (`COPY ... TO ... (FORMAT qvd)`) non implémentée.
 - Tags `$time`/`$interval` non encore mappés (TIME/INTERVAL) → numériques.
 
@@ -113,7 +123,7 @@ Pour tester sur de vrais QVD : déposer des fichiers dans `test/data/` et adapte
 
 - [x] Lecture `read_qvd('fichier.qvd')` avec typage BIGINT/DOUBLE/VARCHAR + NULL.
 - [x] Types temporels natifs `DATE`/`TIMESTAMP` (conversion du numéro de série Qlik).
-- [ ] Projection pushdown (OpenQVD expose `from_path_projected`).
+- [x] Projection pushdown via `from_path_projected` (seules les colonnes utiles décodées).
 - [ ] Glob `read_qvd('data/*.qvd')`.
 - [ ] Écriture `COPY ... TO ... (FORMAT qvd)` (dépend de l'état de l'API copy C).
 

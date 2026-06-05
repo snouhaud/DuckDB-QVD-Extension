@@ -14,24 +14,29 @@
 //!
 //! # Correspondance des types
 //!
-//! Au niveau mémoire un QVD ne connaît que 5 types ([`Value`]). On en déduit
-//! un type DuckDB par colonne en inspectant les valeurs réellement décodées :
+//! Le type DuckDB est déduit des **tags Qlik** de l'en-tête (signal fiable,
+//! présent dans tout QVD produit par Qlik), avec repli sur la balise `<Type>` :
 //!
-//! | Contenu de la colonne                    | Type DuckDB |
-//! |------------------------------------------|-------------|
-//! | uniquement entiers                       | `BIGINT`    |
-//! | au moins un flottant, aucun texte        | `DOUBLE`    |
-//! | au moins une chaîne                      | `VARCHAR`   |
-//! | type déclaré DATE/TIME/TIMESTAMP/INTERVAL| `VARCHAR`*  |
+//! | Tag Qlik (ou `<Type>` en repli) | Type DuckDB |
+//! |---------------------------------|-------------|
+//! | `$date`                         | `DATE`      |
+//! | `$timestamp` (sans `$date`)     | `TIMESTAMP` |
+//! | `$text` / `$ascii`              | `VARCHAR`   |
+//! | `$integer`                      | `BIGINT`    |
+//! | `$numeric` (sans `$integer`)    | `DOUBLE`    |
 //!
-//! \* Les champs temporels sont exposés via le **texte « dual »** rendu par
-//! Qlik (fidèle et lisible). Le mapping vers les types temporels natifs de
-//! DuckDB (conversion du numéro de série Qlik) est une amélioration future.
+//! Choisir le type à partir des seules métadonnées permet de typer au `bind`
+//! sans décoder les données, ce qui rend possible la **projection pushdown** :
+//! seules les colonnes réellement demandées sont décodées (via
+//! `Qvd::from_path_projected`).
+//!
+//! Les séries temporelles Qlik (numéro de série, époque 1899-12-30) sont
+//! converties en `DATE`/`TIMESTAMP` natif DuckDB.
 
 use std::error::Error;
 
 use duckdb::core::LogicalTypeId;
-use openqvd::{Qvd, Value};
+use openqvd::{FieldHeader, Qvd, Value};
 
 /// Une colonne entièrement matérialisée et typée pour DuckDB.
 ///
@@ -46,20 +51,18 @@ pub(crate) enum ColumnData {
     Timestamp(Vec<Option<i64>>),
 }
 
-/// Résultat de la lecture d'un fichier QVD, prêt pour `bind`/`func`.
-pub(crate) struct QvdData {
-    /// Noms des champs, dans l'ordre des colonnes.
+/// Schéma d'un QVD : noms, catégories et types DuckDB de toutes les colonnes.
+/// Lu au `bind` sans décoder les données.
+pub(crate) struct Schema {
     pub names: Vec<String>,
-    /// Type DuckDB de chaque colonne (même ordre que `names`).
+    pub kinds: Vec<Kind>,
     pub type_ids: Vec<LogicalTypeId>,
-    /// Données matérialisées, une entrée par colonne.
-    pub columns: Vec<ColumnData>,
-    /// Nombre de lignes (identique pour toutes les colonnes).
-    pub num_rows: usize,
 }
 
-/// Catégorie de colonne déduite des valeurs décodées.
-enum Kind {
+/// Catégorie de colonne, déduite des tags Qlik. `Copy` pour être conservée
+/// dans la `BindData` et réutilisée à l'`init`.
+#[derive(Clone, Copy)]
+pub(crate) enum Kind {
     Int,
     Float,
     Text,
@@ -67,98 +70,114 @@ enum Kind {
     Timestamp,
 }
 
+impl Kind {
+    fn type_id(self) -> LogicalTypeId {
+        match self {
+            Kind::Int => LogicalTypeId::Bigint,
+            Kind::Float => LogicalTypeId::Double,
+            Kind::Text => LogicalTypeId::Varchar,
+            Kind::Date => LogicalTypeId::Date,
+            Kind::Timestamp => LogicalTypeId::Timestamp,
+        }
+    }
+}
+
 /// Décalage entre l'époque des numéros de série Qlik (1899-12-30) et celle de
 /// DuckDB (1970-01-01), en jours.
 const QLIK_EPOCH_OFFSET_DAYS: f64 = 25569.0;
 const MICROS_PER_DAY: f64 = 86_400_000_000.0;
 
-/// Lit un fichier QVD et le matérialise en colonnes typées.
-pub(crate) fn read_qvd(path: &str) -> Result<QvdData, Box<dyn Error>> {
-    let qvd = Qvd::from_path(path)?;
-
-    let names: Vec<String> = qvd.fields().iter().map(|f| f.name.clone()).collect();
-    let n_fields = names.len();
-
-    // Détection des champs temporels par les tags Qlik. C'est le signal fiable
-    // (la balise <Type> vaut souvent UNKNOWN même pour de vraies dates).
-    let temporal: Vec<bool> = qvd
-        .fields()
-        .iter()
-        .map(|f| f.tags.iter().any(|t| t == "$date" || t == "$timestamp"))
-        .collect();
-
-    // Lecture row-major → accumulation colonne par colonne (Value bruts).
-    let mut raw: Vec<Vec<Option<Value>>> =
-        (0..n_fields).map(|_| Vec::new()).collect();
-    for row in qvd.checked_rows() {
-        let row = row?; // Vec<Option<Value>>, propage QvdError
-        for (j, cell) in row.into_iter().enumerate() {
-            if j < n_fields {
-                raw[j].push(cell);
-            }
-        }
+/// Lit uniquement le schéma (en-tête) d'un QVD, sans décoder les données.
+///
+/// `from_path_projected(path, &[])` parse l'en-tête XML (donc tous les champs)
+/// mais ne décode aucune colonne. Le type est déduit des tags Qlik.
+pub(crate) fn read_schema(path: &str) -> Result<Schema, Box<dyn Error>> {
+    let qvd = Qvd::from_path_projected(path, &[])?;
+    let mut names = Vec::new();
+    let mut kinds = Vec::new();
+    let mut type_ids = Vec::new();
+    for f in qvd.fields() {
+        let kind = kind_of_field(f);
+        names.push(f.name.clone());
+        type_ids.push(kind.type_id());
+        kinds.push(kind);
     }
-    let num_rows = raw.first().map(|c| c.len()).unwrap_or(0);
-
-    // Déduction du type + conversion par colonne.
-    let mut type_ids = Vec::with_capacity(n_fields);
-    let mut columns = Vec::with_capacity(n_fields);
-    for (j, raw_col) in raw.into_iter().enumerate() {
-        let kind = infer_kind(&raw_col, temporal[j]);
-        let (type_id, column) = match kind {
-            Kind::Int => (
-                LogicalTypeId::Bigint,
-                ColumnData::I64(raw_col.into_iter().map(|c| c.and_then(value_to_i64)).collect()),
-            ),
-            Kind::Float => (
-                LogicalTypeId::Double,
-                ColumnData::F64(raw_col.into_iter().map(|c| c.and_then(|v| value_as_f64(&v))).collect()),
-            ),
-            Kind::Text => (
-                LogicalTypeId::Varchar,
-                ColumnData::Utf8(raw_col.into_iter().map(|c| c.map(value_to_string)).collect()),
-            ),
-            Kind::Date => (
-                LogicalTypeId::Date,
-                ColumnData::Date(raw_col.into_iter().map(|c| c.and_then(|v| serial_to_days(&v))).collect()),
-            ),
-            Kind::Timestamp => (
-                LogicalTypeId::Timestamp,
-                ColumnData::Timestamp(raw_col.into_iter().map(|c| c.and_then(|v| serial_to_micros(&v))).collect()),
-            ),
-        };
-        type_ids.push(type_id);
-        columns.push(column);
-    }
-
-    Ok(QvdData { names, type_ids, columns, num_rows })
+    Ok(Schema { names, kinds, type_ids })
 }
 
-/// Déduit la catégorie d'une colonne à partir des valeurs réellement décodées.
+/// Décode et matérialise uniquement les colonnes désignées par `indices`
+/// (positions dans le schéma complet), dans cet ordre — c'est le cœur de la
+/// projection pushdown. `kinds` est le typage complet issu de [`read_schema`].
 ///
-/// `temporal` (issu des tags `$date`/`$timestamp`) prime : on choisit alors
-/// `DATE` si toutes les valeurs tombent sur un jour entier, sinon `TIMESTAMP`.
-fn infer_kind(col: &[Option<Value>], temporal: bool) -> Kind {
-    if temporal {
-        let has_time = col
-            .iter()
-            .flatten()
-            .filter_map(value_as_f64)
-            .any(|serial| serial.fract() != 0.0);
-        return if has_time { Kind::Timestamp } else { Kind::Date };
-    }
-    let mut has_float = false;
-    for cell in col.iter().flatten() {
-        match cell {
-            Value::Str(_) => return Kind::Text, // un texte suffit à basculer en VARCHAR
-            Value::Float(_) | Value::DualFloat(_) => has_float = true,
-            Value::Int(_) | Value::DualInt(_) => {}
+/// Renvoie les colonnes (dans l'ordre de `indices`) et le nombre de lignes.
+pub(crate) fn read_projected(
+    path: &str,
+    names: &[String],
+    kinds: &[Kind],
+    indices: &[usize],
+) -> Result<(Vec<ColumnData>, usize), Box<dyn Error>> {
+    // Noms des seuls champs demandés → OpenQVD ne décode que ceux-là.
+    let needed: Vec<&str> = indices.iter().map(|&i| names[i].as_str()).collect();
+    let qvd = Qvd::from_path_projected(path, &needed)?;
+    let num_rows = qvd.num_rows() as usize;
+
+    // `rows()` (non vérifié) : les colonnes non projetées ont une table de
+    // symboles vide et ressortent en `None` — d'où l'usage de `rows()` plutôt
+    // que `checked_rows()`, qui rejetterait ces index volontairement absents.
+    let mut raw: Vec<Vec<Option<Value>>> = (0..indices.len()).map(|_| Vec::new()).collect();
+    for row in qvd.rows() {
+        for (k, &orig) in indices.iter().enumerate() {
+            raw[k].push(row.get(orig).cloned().flatten());
         }
     }
-    if has_float {
-        Kind::Float
-    } else {
-        Kind::Int
+
+    let columns = raw
+        .into_iter()
+        .enumerate()
+        .map(|(k, col)| materialize(col, kinds[indices[k]]))
+        .collect();
+    Ok((columns, num_rows))
+}
+
+/// Convertit une colonne de `Value` bruts en colonne typée DuckDB.
+fn materialize(col: Vec<Option<Value>>, kind: Kind) -> ColumnData {
+    match kind {
+        Kind::Int => ColumnData::I64(col.into_iter().map(|c| c.and_then(value_to_i64)).collect()),
+        Kind::Float => ColumnData::F64(col.into_iter().map(|c| c.and_then(|v| value_as_f64(&v))).collect()),
+        Kind::Text => ColumnData::Utf8(col.into_iter().map(|c| c.map(value_to_string)).collect()),
+        Kind::Date => ColumnData::Date(col.into_iter().map(|c| c.and_then(|v| serial_to_days(&v))).collect()),
+        Kind::Timestamp => {
+            ColumnData::Timestamp(col.into_iter().map(|c| c.and_then(|v| serial_to_micros(&v))).collect())
+        }
+    }
+}
+
+/// Déduit la catégorie d'un champ à partir de ses **tags Qlik**, avec repli
+/// sur la balise `<Type>` déclarée (les QVD produits par Qlik sont toujours
+/// taggés ; le repli couvre les fichiers minimalistes).
+fn kind_of_field(f: &FieldHeader) -> Kind {
+    let has = |t: &str| f.tags.iter().any(|x| x == t);
+    if has("$date") {
+        return Kind::Date;
+    }
+    if has("$timestamp") {
+        return Kind::Timestamp;
+    }
+    if has("$text") || has("$ascii") {
+        return Kind::Text;
+    }
+    if has("$integer") {
+        return Kind::Int;
+    }
+    if has("$numeric") {
+        return Kind::Float;
+    }
+    match f.number_format_type() {
+        "INTEGER" => Kind::Int,
+        "REAL" | "FIX" | "MONEY" => Kind::Float,
+        "DATE" => Kind::Date,
+        "TIME" | "TIMESTAMP" => Kind::Timestamp,
+        _ => Kind::Text, // UNKNOWN, ASCII… → texte (sans risque)
     }
 }
 
@@ -210,41 +229,63 @@ mod tests {
     use super::*;
     use openqvd::{Column, WriteTable};
 
+    /// Colonne avec ses tags Qlik (le typage est désormais piloté par les tags).
+    fn tagged(name: &str, values: Vec<Option<Value>>, tags: &[&str]) -> Column {
+        let mut c = Column::new(name, values);
+        c.tags = tags.iter().map(|t| t.to_string()).collect();
+        c
+    }
+
+    /// Données complètes d'un QVD (toutes colonnes) — pour les tests.
+    struct QvdData {
+        names: Vec<String>,
+        type_ids: Vec<LogicalTypeId>,
+        columns: Vec<ColumnData>,
+        num_rows: usize,
+    }
+
+    /// Lit schéma + toutes les colonnes (projection = tous les champs).
+    fn read_all(path: &str) -> QvdData {
+        let s = read_schema(path).unwrap();
+        let indices: Vec<usize> = (0..s.names.len()).collect();
+        let (columns, num_rows) = read_projected(path, &s.names, &s.kinds, &indices).unwrap();
+        QvdData { names: s.names, type_ids: s.type_ids, columns, num_rows }
+    }
+
+    fn write_temp(name: &str, cols: Vec<Column>) -> String {
+        let bytes = WriteTable::new("demo", cols).unwrap().to_bytes().unwrap();
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
     /// Génère un QVD couvrant entiers, flottants, texte, NULL et un champ date
-    /// (tag `$date`, série Qlik), puis le relit via `read_qvd` et vérifie le
-    /// typage et les valeurs de bout en bout.
+    /// (tag `$date`, série Qlik), puis le relit et vérifie typage et valeurs.
     #[test]
     fn read_qvd_infers_types_and_values() {
         // 45000/45001/45002 (série Qlik) → 19431/19432/19433 (jours DuckDB).
-        let mut day = Column::new(
-            "day",
-            vec![
-                Some(Value::Int(45000)),
-                Some(Value::Int(45001)),
-                Some(Value::Int(45002)),
-            ],
-        );
-        day.tags = vec!["$date".to_string(), "$timestamp".to_string()];
-
         let cols = vec![
-            Column::new("id", vec![Some(Value::Int(1)), Some(Value::Int(2)), Some(Value::Int(3))]),
-            Column::new(
+            tagged("id", vec![Some(Value::Int(1)), Some(Value::Int(2)), Some(Value::Int(3))], &["$integer"]),
+            tagged(
                 "price",
                 vec![Some(Value::Float(1.5)), Some(Value::Float(2.0)), Some(Value::Float(3.25))],
+                &["$numeric"],
             ),
-            Column::new(
+            tagged(
                 "name",
                 vec![Some(Value::Str("a".into())), Some(Value::Str("b".into())), Some(Value::Str("a".into()))],
+                &["$text"],
             ),
-            Column::new("qty", vec![Some(Value::Int(10)), None, Some(Value::Int(30))]),
-            day,
+            tagged("qty", vec![Some(Value::Int(10)), None, Some(Value::Int(30))], &["$integer"]),
+            tagged(
+                "day",
+                vec![Some(Value::Int(45000)), Some(Value::Int(45001)), Some(Value::Int(45002))],
+                &["$date", "$timestamp"],
+            ),
         ];
 
-        let bytes = WriteTable::new("demo", cols).unwrap().to_bytes().unwrap();
-        let path = std::env::temp_dir().join("openqvd_read_qvd_test.qvd");
-        std::fs::write(&path, bytes).unwrap();
-
-        let data = read_qvd(path.to_str().unwrap()).unwrap();
+        let path = write_temp("openqvd_read_qvd_test.qvd", cols);
+        let data = read_all(&path);
 
         assert_eq!(data.num_rows, 3);
         assert_eq!(data.names, ["id", "price", "name", "qty", "day"]);
@@ -278,6 +319,34 @@ mod tests {
         match &data.columns[4] {
             ColumnData::Date(v) => assert_eq!(v, &[Some(19431), Some(19432), Some(19433)]),
             _ => panic!("day devrait être Date"),
+        }
+    }
+
+    /// `read_projected` ne renvoie que les colonnes demandées, dans l'ordre
+    /// demandé (projection pushdown).
+    #[test]
+    fn projection_reads_only_requested_columns() {
+        let cols = vec![
+            tagged("a", vec![Some(Value::Int(1)), Some(Value::Int(2))], &["$integer"]),
+            tagged("b", vec![Some(Value::Float(9.5)), Some(Value::Float(8.5))], &["$numeric"]),
+            tagged("c", vec![Some(Value::Str("x".into())), Some(Value::Str("y".into()))], &["$text"]),
+        ];
+        let path = write_temp("openqvd_projection_test.qvd", cols);
+
+        let s = read_schema(&path).unwrap();
+        assert_eq!(s.names, ["a", "b", "c"]);
+
+        // Projeter c puis a (ordre inversé, b exclue).
+        let (columns, num_rows) = read_projected(&path, &s.names, &s.kinds, &[2, 0]).unwrap();
+        assert_eq!(num_rows, 2);
+        assert_eq!(columns.len(), 2);
+        match &columns[0] {
+            ColumnData::Utf8(v) => assert_eq!(v, &[Some("x".to_string()), Some("y".to_string())]),
+            _ => panic!("position 0 devrait être la colonne c (VARCHAR)"),
+        }
+        match &columns[1] {
+            ColumnData::I64(v) => assert_eq!(v, &[Some(1), Some(2)]),
+            _ => panic!("position 1 devrait être la colonne a (BIGINT)"),
         }
     }
 
@@ -333,7 +402,7 @@ mod tests {
             }
             let p = path.to_str().unwrap();
             println!("\n===== {p} =====");
-            let data = read_qvd(p).unwrap();
+            let data = read_all(p);
             println!("{} lignes, {} colonnes", data.num_rows, data.columns.len());
             for (name, col) in data.names.iter().zip(&data.columns) {
                 println!("  {name}: {}", type_name(col));
