@@ -5,6 +5,7 @@
 //! [`mod@qvd`], qui s'appuie sur le crate OpenQVD.
 
 mod copy;
+mod copy_from;
 mod qvd;
 
 use duckdb::{

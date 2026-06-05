@@ -7,6 +7,7 @@ Extension DuckDB **100 % Rust** pour **lire et écrire** les fichiers Qlik
 ```sql
 SELECT * FROM read_qvd('ventes.qvd');
 COPY (SELECT * FROM ventes) TO 'sortie.qvd' (FORMAT qvd);
+COPY ventes FROM 'sortie.qvd' (FORMAT qvd);
 ```
 
 ## État du projet
@@ -95,6 +96,21 @@ Limites d'écriture :
 - Les `INTERVAL` avec une composante en **mois** sont approximés à 30 jours/mois
   (le format QVD n'a pas de notion de mois).
 
+### Import : `COPY table FROM 'fichier.qvd' (FORMAT qvd)`
+
+```sql
+CREATE TABLE ventes(nom VARCHAR, date_vente DATE, total BIGINT);
+COPY ventes FROM 'ventes.qvd' (FORMAT qvd);
+```
+
+Dans l'API C, le `COPY ... FROM` délègue à une **table function** ; comme
+duckdb-rs n'expose pas le `duckdb_table_function` brut d'un `VTab`, elle est
+construite en FFI dans [`src/copy_from.rs`](src/copy_from.rs) et réutilise la
+lecture/typage de `read_qvd`. Tous les types (dont `DATE`/`TIME`/`INTERVAL`) et
+les `NULL` sont restitués ; round-trip `COPY TO` → `COPY FROM` vérifié.
+
+(Équivalent à `INSERT INTO ventes SELECT * FROM read_qvd('ventes.qvd')`.)
+
 ### Limitations connues (améliorations futures)
 
 - Typage piloté par les tags Qlik ; un QVD sans tags retombe sur `<Type>` puis
@@ -173,7 +189,7 @@ Pour tester sur de vrais QVD : déposer des fichiers dans `test/data/` et adapte
 - [x] Préserver les noms de colonnes à l'écriture (option `FIELD_NAMES`).
 - [x] Écriture des `DECIMAL` (toutes largeurs i16/i32/i64/i128 → DOUBLE).
 - [x] Écriture `TIME`/`INTERVAL` (round-trip temporel complet vérifié).
-- [ ] Lecture `COPY ... FROM 'x.qvd'`.
+- [x] Import `COPY table FROM 'x.qvd'` (table function FFI ; round-trip vérifié).
 
 ## Licence
 

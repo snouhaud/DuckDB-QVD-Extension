@@ -362,6 +362,9 @@ pub(crate) unsafe fn register(con: ffi::duckdb_connection) -> Result<(), String>
     ffi::duckdb_copy_function_set_sink(cf, Some(copy_sink));
     ffi::duckdb_copy_function_set_finalize(cf, Some(copy_finalize));
 
+    // COPY ... FROM : déléguée à une table function (lecture).
+    ffi::duckdb_copy_function_set_copy_from_function(cf, crate::copy_from::build());
+
     let rc = ffi::duckdb_register_copy_function(con, cf);
     let mut cf_mut = cf;
     ffi::duckdb_destroy_copy_function(&mut cf_mut);
