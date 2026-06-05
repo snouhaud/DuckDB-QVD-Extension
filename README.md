@@ -125,6 +125,30 @@ les `NULL` sont restitués ; round-trip `COPY TO` → `COPY FROM` vérifié.
   OpenQVD).
 - Glob local uniquement (pas de système de fichiers DuckDB : ni httpfs ni S3).
 
+## Performances (lecture)
+
+Mesuré sur `flights.QVD` (**460 Mo, 10 millions de lignes, ~50 colonnes**),
+DuckDB v1.5.3, **builds release**, RSS de pointe via `/usr/bin/time -l` (macOS,
+Apple Silicon). Comparaison entre la version actuelle (`qvdrs`, streaming) et
+l'ancienne (OpenQVD, tout matérialisé) :
+
+| Requête | OpenQVD (avant) | `qvdrs` (streaming) |
+|---|---|---|
+| `SELECT count(*)` | 2 s · **1520 Mo** | 7 s · **37 Mo** |
+| `SELECT count(DISTINCT Origin)` | 3 s · **1445 Mo** | 8 s · **45 Mo** |
+| `SELECT max(Distance)` | 2 s · **1440 Mo** | 8 s · **38 Mo** |
+
+**Mémoire : ~30–40× moins (≈1,4 Go → ~40 Mo, −97 %).** L'ancienne version chargeait
+le fichier entier en RAM (OpenQVD en clonant les octets) puis matérialisait toutes
+les lignes — coût ~constant ≈1,4 Go quelle que soit la requête, **croissant avec la
+taille du fichier**. Le streaming reste **borné** (tables de symboles + un chunk),
+indépendamment du nombre de lignes ; l'écart se creuse encore sur des fichiers plus
+gros.
+
+**Temps : ~3× plus lent.** Le compromis assumé du streaming. Le surcoût vient
+surtout du décodage *eager* de **toutes** les tables de symboles par `qvdrs`
+(le parcours de l'index par chunks, lui, est rapide) — piste d'optimisation future.
+
 ## Structure
 
 | Fichier | Rôle |
