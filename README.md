@@ -88,9 +88,12 @@ COPY (SELECT id, montant, jour FROM ventes)
 Le nombre de noms doit égaler le nombre de colonnes (sinon erreur).
 
 Limites d'écriture :
-- Types lus : BOOLEAN/TINYINT/SMALLINT/INTEGER/BIGINT/FLOAT/DOUBLE/`DECIMAL`/
-  VARCHAR/DATE/TIMESTAMP (le `DECIMAL` est converti en `DOUBLE`, comme le permet
-  le format QVD). Les autres (ex. `HUGEINT`, types non signés) exigent un `CAST`.
+- Types écrits : BOOLEAN/TINYINT/SMALLINT/INTEGER/BIGINT/FLOAT/DOUBLE/`DECIMAL`/
+  VARCHAR/DATE/TIMESTAMP/TIME/INTERVAL (le `DECIMAL` est converti en `DOUBLE`,
+  comme le permet le format QVD). Les autres (ex. `HUGEINT`, types non signés)
+  exigent un `CAST`.
+- Les `INTERVAL` avec une composante en **mois** sont approximés à 30 jours/mois
+  (le format QVD n'a pas de notion de mois).
 
 ### Limitations connues (améliorations futures)
 
@@ -169,6 +172,7 @@ Pour tester sur de vrais QVD : déposer des fichiers dans `test/data/` et adapte
 - [x] Écriture `COPY ... TO ... (FORMAT qvd)` (copy function FFI ; round-trip vérifié).
 - [x] Préserver les noms de colonnes à l'écriture (option `FIELD_NAMES`).
 - [x] Écriture des `DECIMAL` (toutes largeurs i16/i32/i64/i128 → DOUBLE).
+- [x] Écriture `TIME`/`INTERVAL` (round-trip temporel complet vérifié).
 - [ ] Lecture `COPY ... FROM 'x.qvd'`.
 
 ## Licence

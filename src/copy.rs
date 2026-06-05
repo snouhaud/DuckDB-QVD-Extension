@@ -43,6 +43,8 @@ enum WriteKind {
     Str,
     Date,
     Timestamp,
+    Time,
+    Interval,
     /// `DECIMAL(w, s)` : entier non-scalé `phys` à diviser par 10^`scale`.
     Decimal { scale: u32, phys: DecimalPhys },
 }
@@ -79,6 +81,8 @@ impl WriteKind {
             ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR => WriteKind::Str,
             ffi::DUCKDB_TYPE_DUCKDB_TYPE_DATE => WriteKind::Date,
             ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP => WriteKind::Timestamp,
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIME => WriteKind::Time,
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL => WriteKind::Interval,
             _ => return None,
         })
     }
@@ -93,6 +97,8 @@ impl WriteKind {
             WriteKind::Str => &["$text"],
             WriteKind::Date => &["$date"],
             WriteKind::Timestamp => &["$timestamp"],
+            WriteKind::Time => &["$time"],
+            WriteKind::Interval => &["$interval"],
         };
         t.iter().map(|s| s.to_string()).collect()
     }
@@ -121,6 +127,18 @@ impl WriteKind {
             WriteKind::Timestamp => {
                 let us = *(data as *const i64).add(r);
                 Value::Float(us as f64 / MICROS_PER_DAY + QLIK_EPOCH_OFFSET_DAYS)
+            }
+            WriteKind::Time => {
+                // µs depuis minuit → fraction de jour Qlik.
+                let us = *(data as *const i64).add(r);
+                Value::Float(us as f64 / MICROS_PER_DAY)
+            }
+            WriteKind::Interval => {
+                // INTERVAL → durée en jours (mois approximés à 30 jours, le
+                // format QVD n'ayant pas de notion de mois).
+                let iv = *(data as *const ffi::duckdb_interval).add(r);
+                let days = (iv.months * 30 + iv.days) as f64;
+                Value::Float(days + iv.micros as f64 / MICROS_PER_DAY)
             }
             WriteKind::Decimal { scale, phys } => {
                 let unscaled = match phys {
