@@ -21,6 +21,15 @@ use openqvd::{Column, Value, WriteTable};
 
 use crate::qvd::{MICROS_PER_DAY, QLIK_EPOCH_OFFSET_DAYS};
 
+/// Largeur physique de stockage d'un `DECIMAL` (entier non-scalé).
+#[derive(Clone, Copy)]
+enum DecimalPhys {
+    I16,
+    I32,
+    I64,
+    I128,
+}
+
 /// Stratégie de lecture d'une colonne entrante (selon son type DuckDB).
 #[derive(Clone, Copy)]
 enum WriteKind {
@@ -34,9 +43,29 @@ enum WriteKind {
     Str,
     Date,
     Timestamp,
+    /// `DECIMAL(w, s)` : entier non-scalé `phys` à diviser par 10^`scale`.
+    Decimal { scale: u32, phys: DecimalPhys },
 }
 
 impl WriteKind {
+    /// Déduit la stratégie d'un type logique (nécessaire pour `DECIMAL`, dont
+    /// la largeur/échelle dépendent du type, pas seulement de l'identifiant).
+    unsafe fn of_logical_type(lt: ffi::duckdb_logical_type) -> Option<Self> {
+        let tid = ffi::duckdb_get_type_id(lt);
+        if tid == ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL {
+            let scale = ffi::duckdb_decimal_scale(lt) as u32;
+            let phys = match ffi::duckdb_decimal_internal_type(lt) {
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT => DecimalPhys::I16,
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER => DecimalPhys::I32,
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT => DecimalPhys::I64,
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT => DecimalPhys::I128,
+                _ => return None,
+            };
+            return Some(WriteKind::Decimal { scale, phys });
+        }
+        Self::from_type_id(tid)
+    }
+
     /// Déduit la stratégie depuis l'identifiant de type DuckDB.
     fn from_type_id(tid: ffi::duckdb_type) -> Option<Self> {
         Some(match tid {
@@ -60,7 +89,7 @@ impl WriteKind {
             WriteKind::Bool | WriteKind::I8 | WriteKind::I16 | WriteKind::I32 | WriteKind::I64 => {
                 &["$numeric", "$integer"]
             }
-            WriteKind::F32 | WriteKind::F64 => &["$numeric"],
+            WriteKind::F32 | WriteKind::F64 | WriteKind::Decimal { .. } => &["$numeric"],
             WriteKind::Str => &["$text"],
             WriteKind::Date => &["$date"],
             WriteKind::Timestamp => &["$timestamp"],
@@ -92,6 +121,15 @@ impl WriteKind {
             WriteKind::Timestamp => {
                 let us = *(data as *const i64).add(r);
                 Value::Float(us as f64 / MICROS_PER_DAY + QLIK_EPOCH_OFFSET_DAYS)
+            }
+            WriteKind::Decimal { scale, phys } => {
+                let unscaled = match phys {
+                    DecimalPhys::I16 => *(data as *const i16).add(r) as i128,
+                    DecimalPhys::I32 => *(data as *const i32).add(r) as i128,
+                    DecimalPhys::I64 => *(data as *const i64).add(r) as i128,
+                    DecimalPhys::I128 => *(data as *const i128).add(r),
+                };
+                Value::Float(unscaled as f64 / 10f64.powi(scale as i32))
             }
             WriteKind::Str => {
                 let s_ptr = (data as *mut ffi::duckdb_string_t).add(r);
@@ -196,9 +234,10 @@ unsafe extern "C" fn copy_bind(info: ffi::duckdb_copy_function_bind_info) {
     let mut kinds = Vec::with_capacity(n);
     for i in 0..n {
         let mut lt = ffi::duckdb_copy_function_bind_get_column_type(info, i as u64);
+        let kind = WriteKind::of_logical_type(lt);
         let tid = ffi::duckdb_get_type_id(lt);
         ffi::duckdb_destroy_logical_type(&mut lt);
-        match WriteKind::from_type_id(tid) {
+        match kind {
             Some(k) => kinds.push(k),
             None => {
                 set_error(format!(
