@@ -1,0 +1,9 @@
+/target
+/build
+/extension-ci-tools
+/duckdb
+*.duckdb_extension
+.venv
+__pycache__/
+.DS_Store
+extension-ci-tools/

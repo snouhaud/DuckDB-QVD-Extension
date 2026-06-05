@@ -1,0 +1,3 @@
+[toolchain]
+# Le crate `duckdb` 1.10502.0 et ses dépendances Arrow exigent Rust >= 1.85.1.
+channel = "1.95.0"

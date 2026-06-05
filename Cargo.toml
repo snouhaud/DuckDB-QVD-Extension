@@ -1,0 +1,29 @@
+[package]
+name = "qvd"
+version = "0.1.0"
+edition = "2021"
+description = "Extension DuckDB pour lire les fichiers Qlik QVD via OpenQVD"
+license = "Apache-2.0"
+
+[lib]
+# cdylib : extension chargeable DuckDB. rlib : permet `cargo test`.
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+lto = true
+strip = true
+
+[[example]]
+# crate-type ne peut pas (pour l'instant) être surchargé par cible.
+# src/wasm_lib.rs réexporte src/lib.rs pour passer de cdylib (compilation
+# native) à staticlib (nécessaire pour le linkage final via emcc en Wasm).
+name = "qvd"
+path = "src/wasm_lib.rs"
+crate-type = ["staticlib"]
+
+[dependencies]
+# Plomberie de l'extension DuckDB (table functions, VTab, entrypoint C-API).
+duckdb = { version = "=1.10502.0", features = ["loadable-extension"] }
+
+# Lecteur/décodeur du format QVD (API décodée, sans la feature "arrow").
+openqvd = "1"
