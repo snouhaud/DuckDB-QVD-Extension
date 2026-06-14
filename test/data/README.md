@@ -1,2 +1,2 @@
-# Déposez ici vos fichiers .qvd de test.
-# Référencez-les via read_qvd('test/data/votre_fichier.qvd').
+# Drop your test .qvd files here.
+# Reference them via read_qvd('test/data/your_file.qvd').

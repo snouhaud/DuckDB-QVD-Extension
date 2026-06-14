@@ -1,0 +1,31 @@
+# name: test/sql/qvd.test
+# description: Read a sample QVD file via read_qvd
+# group: [qvd]
+
+require qvd
+
+# Orders.qvd: 5 rows, columns orders.id/user_id/product_id/quantity/order_date.
+query I
+SELECT count(*) FROM read_qvd('QVD-Examples/Orders.qvd');
+----
+5
+
+# Typing: order_date is a real DATE (inferred from the $date tag).
+query I
+SELECT count(*) FROM read_qvd('QVD-Examples/Orders.qvd') WHERE order_date >= DATE '2023-05-03';
+----
+3
+
+# Projection + values (identifier with a dot -> quoted identifier).
+query II
+SELECT "orders.id", order_date
+FROM read_qvd('QVD-Examples/Orders.qvd')
+ORDER BY "orders.id"
+LIMIT 1;
+----
+1	2023-05-01
+
+# Pattern with no match -> clean error.
+statement error
+SELECT * FROM read_qvd('QVD-Examples/__nonexistent__.qvd');
+----

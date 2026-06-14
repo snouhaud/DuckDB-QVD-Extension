@@ -1,23 +1,23 @@
 # name: test/sql/read_qvd.test
-# description: Tests de la table function read_qvd
+# description: Tests for the read_qvd table function
 # group: [qvd]
 
 require qvd
 
-# Un fichier inexistant doit faire échouer la requête proprement.
+# A nonexistent file must make the query fail cleanly.
 statement error
-SELECT * FROM read_qvd('test/data/__inexistant__.qvd');
+SELECT * FROM read_qvd('test/data/__nonexistent__.qvd');
 ----
 
-# --- Tests sur données réelles ---------------------------------------------
-# Déposer un .qvd dans test/data/ puis décommenter et adapter :
+# --- Tests on real data ----------------------------------------------------
+# Drop a .qvd into test/data/ then uncomment and adapt:
 #
 # query I
-# SELECT count(*) FROM read_qvd('test/data/exemple.qvd');
+# SELECT count(*) FROM read_qvd('test/data/example.qvd');
 # ----
 # 42
 #
 # query II
-# SELECT id, name FROM read_qvd('test/data/exemple.qvd') ORDER BY id LIMIT 1;
+# SELECT id, name FROM read_qvd('test/data/example.qvd') ORDER BY id LIMIT 1;
 # ----
 # 1	alpha
