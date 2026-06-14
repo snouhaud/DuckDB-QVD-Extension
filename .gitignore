@@ -1,5 +1,6 @@
 /target
 /build
+/configure
 /extension-ci-tools
 /duckdb
 *.duckdb_extension

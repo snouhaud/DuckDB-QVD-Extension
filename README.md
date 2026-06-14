@@ -171,38 +171,45 @@ make cargo-build        # or: cargo build
 
 ### Loadable extension (`.duckdb_extension`)
 
-Recommended path (compiles + appends the metadata footer, without a venv):
+This project uses the official DuckDB **community build template** from
+[`extension-ci-tools`](https://github.com/duckdb/extension-ci-tools) — the same
+flow the community-extensions infrastructure runs:
 
 ```sh
-git clone --depth 1 https://github.com/duckdb/extension-ci-tools.git
-./scripts/build-extension.sh        # → build/qvd.duckdb_extension
+make bootstrap          # clones extension-ci-tools (once)
+make configure          # creates a Python venv (duckdb + sqllogictest runner)
+make debug              # → build/debug/qvd.duckdb_extension
+# make release          # → build/release/qvd.duckdb_extension
 ```
 
-The script detects the platform and the **version of the local `duckdb`**. For
-the C_STRUCT_UNSTABLE ABI, DuckDB requires the stamped version to match the host
-exactly; the crate targets the C API v1.5.2 and the v1.5.x patches share the same
-struct (tested: loaded in **v1.5.3**).
+`make debug` compiles the library and appends the metadata footer via
+`append_extension_metadata.py`. For the C_STRUCT_UNSTABLE ABI, DuckDB requires
+the stamped version to match the host exactly: `TARGET_DUCKDB_VERSION` is
+**v1.5.3** (the current community version).
 
 Loading (unsigned extension):
 
 ```sh
-duckdb -unsigned -c "LOAD 'build/qvd.duckdb_extension'; \
+duckdb -unsigned -c "LOAD 'build/debug/qvd.duckdb_extension'; \
   SELECT * FROM read_qvd('QVD-Examples/Ventes.qvd');"
 ```
 
-> The official pipeline `make bootstrap && make configure && make debug` remains
-> available, but `make configure` installs a Python venv (duckdb + sqllogictest
-> runner) which may fail depending on the Python version.
+> A standalone script `./scripts/build-extension.sh` also produces a
+> `build/qvd.duckdb_extension` without a venv (it stamps against the locally
+> installed `duckdb` version), handy for quick local checks.
 
 ## Tests
 
 ```sh
-cargo +1.95.0 test --lib    # integration test: generates a QVD then reads it back
+make test                   # SQLLogicTest suite against the built extension
+cargo +1.95.0 test --lib    # Rust unit test: generates a QVD then reads it back
 ```
 
-The test (in [`src/qvd.rs`](src/qvd.rs)) covers integers, floats, text, `NULL`
-and a "dual" field typed as DATE. `--lib` targets the lib (the Wasm "example"
-has a distinct module constraint).
+`make test` runs the `test/sql/*.test` files through the community SQLLogicTest
+runner (requires `make configure && make debug` first). The Rust test (in
+[`src/qvd.rs`](src/qvd.rs)) covers integers, floats, text, `NULL` and a "dual"
+field typed as DATE. `--lib` targets the lib (the Wasm "example" has a distinct
+module constraint).
 
 To test on real QVDs: drop files into `test/data/` and adapt
 [`test/sql/read_qvd.test`](test/sql/read_qvd.test).

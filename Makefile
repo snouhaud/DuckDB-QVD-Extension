@@ -1,24 +1,43 @@
-# Extension DuckDB en Rust basée sur la C Extension API.
+# Rust DuckDB extension based on the C Extension API.
+PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+
 EXTENSION_NAME=qvd
+
+# Set to 1 to enable the unstable C API (binaries only work on TARGET_DUCKDB_VERSION,
+# forward compatibility is broken). Required: duckdb-rs relies on the unstable C API.
 USE_UNSTABLE_C_API=1
-TARGET_DUCKDB_VERSION=v1.5.2
+
+# Target DuckDB version (matches the community-extensions build version).
+TARGET_DUCKDB_VERSION=v1.5.3
 
 all: configure debug
 
-# Récupère l'outillage CI partagé (venv DuckDB + test runner SQLLogicTest).
-# À lancer une fois avant `make configure`.
+# Fetch the shared CI tooling (venv DuckDB + SQLLogicTest runner).
+# Run once before `make configure`.
 .PHONY: bootstrap
 bootstrap:
 	git clone --depth 1 https://github.com/duckdb/extension-ci-tools.git
 
-# Règles de build/test/configure du template C-API (si l'outillage est présent).
-# Le `-include` n'échoue pas tant que `make bootstrap` n'a pas été lancé.
--include extension-ci-tools/makefiles/duckdb_extension_c_api.Makefile
+# Reusable makefiles from extension-ci-tools (the community build template).
+include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
+include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 
-# --- Itération locale rapide (sans l'outillage CI) ------------------------
-# Compile la bibliothèque native. Le footer DuckDB n'est PAS ajouté ici :
-# pour produire un vrai .duckdb_extension chargeable, utiliser `make debug`
-# après `make bootstrap && make configure`.
+configure: venv platform extension_version
+
+debug: build_extension_library_debug build_extension_with_metadata_debug
+release: build_extension_library_release build_extension_with_metadata_release
+
+test: test_debug
+test_debug: test_extension_debug
+test_release: test_extension_release
+
+clean: clean_build clean_rust
+clean_all: clean_configure clean
+
+# --- Fast local iteration (without the CI tooling) ------------------------
+# Builds the native library. The DuckDB footer is NOT appended here: to produce
+# a real loadable .duckdb_extension, use `make debug` after
+# `make bootstrap && make configure`.
 .PHONY: cargo-build cargo-build-release cargo-clean
 cargo-build:
 	cargo build
