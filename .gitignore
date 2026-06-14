@@ -9,6 +9,9 @@ __pycache__/
 .DS_Store
 extension-ci-tools/
 
+# Local only: lives in the duckdb/community-extensions repo, not here.
+/community-extension/
+
 # Jeux de données QVD volumineux (test mémoire/streaming) — non versionnés.
 QVD-Examples/Dest_airport.QVD
 QVD-Examples/Marketing_Airline.QVD
