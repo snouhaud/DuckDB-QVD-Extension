@@ -1,226 +1,224 @@
-# Extension DuckDB `qvd` — `read_qvd()` / `COPY TO (FORMAT qvd)`
+# DuckDB `qvd` Extension — `read_qvd()` / `COPY TO (FORMAT qvd)`
 
-Extension DuckDB **100 % Rust** pour **lire et écrire** les fichiers Qlik
-**QVD**. La **lecture** s'appuie sur [`qvd` (qvdrs)](https://github.com/bintocher/qvdrs)
-(reader **streaming** à mémoire bornée) ; l'**écriture** sur
-[OpenQVD](https://github.com/Sigilweaver/OpenQVD) (contrôle fin des tags).
-
-```sql
-SELECT * FROM read_qvd('ventes.qvd');
-COPY (SELECT * FROM ventes) TO 'sortie.qvd' (FORMAT qvd);
-COPY ventes FROM 'sortie.qvd' (FORMAT qvd);
-```
-
-## État du projet
-
-**Lecture fonctionnelle, vérifiée en DuckDB live (v1.5.3).** L'extension
-s'enregistre, déclare la table function `read_qvd(VARCHAR)` et lit les fichiers
-QVD en **streaming** via `qvdrs` : déduction d'un type DuckDB par champ (au
-`bind`), puis décodage **par chunks de 2048 lignes** (`open_qvd_stream`/
-`next_chunk`), un fichier ouvert à la fois. La mémoire est **bornée** (≈ tables de
-symboles + un chunk), indépendamment du nombre de lignes — plus de matérialisation
-de toutes les lignes. Les colonnes `DATE`/`BIGINT`/`VARCHAR` se comportent comme de
-vrais types SQL (filtres, `EXTRACT`, agrégats). La logique est isolée dans
-[`src/qvd.rs`](src/qvd.rs) et couverte par des tests (`cargo test --lib`).
+**100% Rust** DuckDB extension to **read and write** Qlik **QVD** files.
+**Reading** relies on [`qvd` (qvdrs)](https://github.com/bintocher/qvdrs)
+(a **streaming** reader with bounded memory); **writing** relies on
+[OpenQVD](https://github.com/Sigilweaver/OpenQVD) (fine-grained tag control).
 
 ```sql
-SELECT id, price FROM read_qvd('ventes.qvd') WHERE price > 100;
+SELECT * FROM read_qvd('sales.qvd');
+COPY (SELECT * FROM sales) TO 'output.qvd' (FORMAT qvd);
+COPY sales FROM 'output.qvd' (FORMAT qvd);
 ```
 
-### Correspondance des types
+## Project status
 
-Le type DuckDB est déduit des **tags Qlik** de l'en-tête (lus au `bind`, sans
-décoder les données — ce qui permet la projection pushdown), avec repli sur la
-balise `<Type>` :
+**Reading is functional, verified in live DuckDB (v1.5.3).** The extension
+registers itself, declares the `read_qvd(VARCHAR)` table function, and reads
+QVD files in **streaming** mode via `qvdrs`: a DuckDB type is inferred per field
+(at `bind`), then data is decoded **in chunks of 2048 rows** (`open_qvd_stream`/
+`next_chunk`), one file open at a time. Memory is **bounded** (≈ symbol tables +
+one chunk), regardless of the number of rows — no more materializing all rows.
+The `DATE`/`BIGINT`/`VARCHAR` columns behave like real SQL types (filters,
+`EXTRACT`, aggregates). The logic is isolated in [`src/qvd.rs`](src/qvd.rs) and
+covered by tests (`cargo test --lib`).
 
-| Tag Qlik (repli `<Type>`)    | Type DuckDB |
+```sql
+SELECT id, price FROM read_qvd('sales.qvd') WHERE price > 100;
+```
+
+### Type mapping
+
+The DuckDB type is inferred from the **Qlik tags** in the header (read at `bind`,
+without decoding the data — which enables projection pushdown), with a fallback
+on the `<Type>` element:
+
+| Qlik tag (`<Type>` fallback) | DuckDB type |
 |------------------------------|-------------|
 | `$date`                      | `DATE`      |
-| `$timestamp` (sans `$date`)  | `TIMESTAMP` |
+| `$timestamp` (without `$date`)  | `TIMESTAMP` |
 | `$time`                      | `TIME`      |
 | `$interval`                  | `INTERVAL`  |
 | `$text` / `$ascii`           | `VARCHAR`   |
 | `$integer`                   | `BIGINT`    |
-| `$numeric` (sans `$integer`) | `DOUBLE`    |
+| `$numeric` (without `$integer`) | `DOUBLE`    |
 
-Les tags sont un signal plus fiable que `<Type>` (souvent `UNKNOWN` même pour de
-vraies dates). Le numéro de série Qlik (époque 1899-12-30) est converti en
-`DATE`/`TIMESTAMP` natif. Vérifié sur données réelles : série `33765` →
-`1992-06-10`. Les `NULL` sont préservés.
+Tags are a more reliable signal than `<Type>` (often `UNKNOWN` even for real
+dates). The Qlik serial number (epoch 1899-12-30) is converted to a native
+`DATE`/`TIMESTAMP`. Verified on real data: serial `33765` → `1992-06-10`.
+`NULL`s are preserved.
 
 ### Projection pushdown
 
-`supports_pushdown()` est activé : DuckDB ne demande que les colonnes utiles, et
-seules celles-ci sont décodées via `Qvd::from_path_projected`. Le `bind` ne lit
-que l'en-tête ; le décodage des données a lieu à l'`init`, restreint aux colonnes
-projetées. `SELECT count(*)` ne décode aucune colonne.
+`supports_pushdown()` is enabled: DuckDB only requests the useful columns, and
+only those are decoded via `Qvd::from_path_projected`. The `bind` reads only the
+header; data decoding happens at `init`, restricted to the projected columns.
+`SELECT count(*)` decodes no column.
 
-### Glob multi-fichiers
-
-```sql
-SELECT * FROM read_qvd('data/ventes_*.qvd');
-```
-
-Le motif est déployé (trié) et les lignes de tous les fichiers sont
-**concaténées**. Le schéma est celui du **premier fichier** ; dans chaque fichier
-les champs sont résolus **par nom** (robuste aux écarts d'ordre des colonnes), un
-champ absent ressortant en `NULL`. Un motif sans correspondance lève une erreur.
-
-### Écriture : `COPY ... TO ... (FORMAT qvd)`
+### Multi-file glob
 
 ```sql
-COPY (SELECT id, montant, date_vente FROM ventes) TO 'export.qvd' (FORMAT qvd);
+SELECT * FROM read_qvd('data/sales_*.qvd');
 ```
 
-Implémentée via une **copy function** de l'API C (non wrappée par duckdb-rs,
-pilotée en FFI dans [`src/copy.rs`](src/copy.rs)) : `bind` (types) →
-`global_init` (chemin) → `sink` (accumulation) → `finalize` (écriture OpenQVD).
-Types préservés et taggés pour relecture (`BIGINT`/`DOUBLE`/`VARCHAR`/`DATE`/
-`TIMESTAMP`), `NULL` et UTF-8 conservés. Vérifié en round-trip `read_qvd` →
-`COPY` → `read_qvd`.
+The pattern is expanded (sorted) and rows from all files are **concatenated**.
+The schema is that of the **first file**; within each file fields are resolved
+**by name** (robust to column-ordering differences), with a missing field coming
+out as `NULL`. A pattern with no match raises an error.
 
-**Noms de colonnes.** L'API C de la copy function n'expose pas les noms de
-colonnes : par défaut les champs sont `field0`, `field1`, … On peut les fournir
-explicitement via l'option `FIELD_NAMES` (les deux syntaxes sont acceptées) :
+### Writing: `COPY ... TO ... (FORMAT qvd)`
 
 ```sql
-COPY (SELECT id, montant, jour FROM ventes)
-  TO 'export.qvd' (FORMAT qvd, FIELD_NAMES (id, montant, jour));
--- ou :  FIELD_NAMES ['id', 'montant', 'jour']
+COPY (SELECT id, amount, sale_date FROM sales) TO 'export.qvd' (FORMAT qvd);
 ```
 
-Le nombre de noms doit égaler le nombre de colonnes (sinon erreur).
+Implemented via a **copy function** of the C API (not wrapped by duckdb-rs,
+driven in FFI in [`src/copy.rs`](src/copy.rs)): `bind` (types) →
+`global_init` (path) → `sink` (accumulation) → `finalize` (OpenQVD write).
+Types are preserved and tagged for reading back (`BIGINT`/`DOUBLE`/`VARCHAR`/
+`DATE`/`TIMESTAMP`), `NULL` and UTF-8 are kept. Verified in a round-trip
+`read_qvd` → `COPY` → `read_qvd`.
 
-Limites d'écriture :
-- Types écrits : BOOLEAN/TINYINT/SMALLINT/INTEGER/BIGINT/FLOAT/DOUBLE/`DECIMAL`/
-  VARCHAR/DATE/TIMESTAMP/TIME/INTERVAL (le `DECIMAL` est converti en `DOUBLE`,
-  comme le permet le format QVD). Les autres (ex. `HUGEINT`, types non signés)
-  exigent un `CAST`.
-- Les `INTERVAL` avec une composante en **mois** sont approximés à 30 jours/mois
-  (le format QVD n'a pas de notion de mois).
-
-### Import : `COPY table FROM 'fichier.qvd' (FORMAT qvd)`
+**Column names.** The C API of the copy function does not expose column names:
+by default the fields are `field0`, `field1`, … They can be supplied explicitly
+via the `FIELD_NAMES` option (both syntaxes are accepted):
 
 ```sql
-CREATE TABLE ventes(nom VARCHAR, date_vente DATE, total BIGINT);
-COPY ventes FROM 'ventes.qvd' (FORMAT qvd);
+COPY (SELECT id, amount, day FROM sales)
+  TO 'export.qvd' (FORMAT qvd, FIELD_NAMES (id, amount, day));
+-- or:  FIELD_NAMES ['id', 'amount', 'day']
 ```
 
-Dans l'API C, le `COPY ... FROM` délègue à une **table function** ; comme
-duckdb-rs n'expose pas le `duckdb_table_function` brut d'un `VTab`, elle est
-construite en FFI dans [`src/copy_from.rs`](src/copy_from.rs) et réutilise la
-lecture/typage de `read_qvd`. Tous les types (dont `DATE`/`TIME`/`INTERVAL`) et
-les `NULL` sont restitués ; round-trip `COPY TO` → `COPY FROM` vérifié.
+The number of names must equal the number of columns (otherwise an error).
 
-(Équivalent à `INSERT INTO ventes SELECT * FROM read_qvd('ventes.qvd')`.)
+Write limitations:
+- Types written: BOOLEAN/TINYINT/SMALLINT/INTEGER/BIGINT/FLOAT/DOUBLE/`DECIMAL`/
+  VARCHAR/DATE/TIMESTAMP/TIME/INTERVAL (the `DECIMAL` is converted to `DOUBLE`,
+  as the QVD format allows). The others (e.g. `HUGEINT`, unsigned types) require
+  a `CAST`.
+- `INTERVAL`s with a **month** component are approximated to 30 days/month
+  (the QVD format has no notion of months).
 
-### Limitations connues (améliorations futures)
+### Import: `COPY table FROM 'file.qvd' (FORMAT qvd)`
 
-- Typage piloté par les tags Qlik ; un QVD sans tags retombe sur `<Type>` puis
-  `VARCHAR` par défaut (les fichiers produits par Qlik sont toujours taggés).
-- **Lecture en streaming à mémoire bornée** (≈ tables de symboles + un chunk).
-  En revanche `qvdrs` décode **toutes** les tables de symboles du fichier (pas de
-  projection au niveau symboles) ; la projection s'applique à l'émission.
-- L'**écriture** (`COPY TO`) accumule encore toutes les lignes en mémoire (writer
-  OpenQVD).
-- Glob local uniquement (pas de système de fichiers DuckDB : ni httpfs ni S3).
+```sql
+CREATE TABLE sales(name VARCHAR, sale_date DATE, total BIGINT);
+COPY sales FROM 'sales.qvd' (FORMAT qvd);
+```
 
-## Performances (lecture)
+In the C API, `COPY ... FROM` delegates to a **table function**; since duckdb-rs
+does not expose the raw `duckdb_table_function` of a `VTab`, it is built in FFI
+in [`src/copy_from.rs`](src/copy_from.rs) and reuses the reading/typing of
+`read_qvd`. All types (including `DATE`/`TIME`/`INTERVAL`) and `NULL`s are
+restored; round-trip `COPY TO` → `COPY FROM` verified.
 
-Mesuré sur `flights.QVD` (**460 Mo, 10 millions de lignes, ~50 colonnes**),
-DuckDB v1.5.3, **builds release**, RSS de pointe via `/usr/bin/time -l` (macOS,
-Apple Silicon). Comparaison entre la version actuelle (`qvdrs`, streaming) et
-l'ancienne (OpenQVD, tout matérialisé) :
+(Equivalent to `INSERT INTO sales SELECT * FROM read_qvd('sales.qvd')`.)
 
-| Requête | OpenQVD (avant) | `qvdrs` (streaming) |
+### Known limitations (future improvements)
+
+- Typing driven by Qlik tags; a QVD without tags falls back to `<Type>` and then
+  `VARCHAR` by default (files produced by Qlik are always tagged).
+- **Streaming read with bounded memory** (≈ symbol tables + one chunk).
+  However, `qvdrs` decodes **all** the symbol tables in the file (no projection
+  at the symbol level); projection is applied at emission.
+- **Writing** (`COPY TO`) still accumulates all rows in memory (OpenQVD writer).
+- Local glob only (no DuckDB file system: neither httpfs nor S3).
+
+## Performance (reading)
+
+Measured on `flights.QVD` (**460 MB, 10 million rows, ~50 columns**),
+DuckDB v1.5.3, **release builds**, peak RSS via `/usr/bin/time -l` (macOS,
+Apple Silicon). Comparison between the current version (`qvdrs`, streaming) and
+the previous one (OpenQVD, everything materialized):
+
+| Query | OpenQVD (before) | `qvdrs` (streaming) |
 |---|---|---|
-| `SELECT count(*)` | 2 s · **1520 Mo** | 7 s · **37 Mo** |
-| `SELECT count(DISTINCT Origin)` | 3 s · **1445 Mo** | 8 s · **45 Mo** |
-| `SELECT max(Distance)` | 2 s · **1440 Mo** | 8 s · **38 Mo** |
+| `SELECT count(*)` | 2 s · **1520 MB** | 7 s · **37 MB** |
+| `SELECT count(DISTINCT Origin)` | 3 s · **1445 MB** | 8 s · **45 MB** |
+| `SELECT max(Distance)` | 2 s · **1440 MB** | 8 s · **38 MB** |
 
-**Mémoire : ~30–40× moins (≈1,4 Go → ~40 Mo, −97 %).** L'ancienne version chargeait
-le fichier entier en RAM (OpenQVD en clonant les octets) puis matérialisait toutes
-les lignes — coût ~constant ≈1,4 Go quelle que soit la requête, **croissant avec la
-taille du fichier**. Le streaming reste **borné** (tables de symboles + un chunk),
-indépendamment du nombre de lignes ; l'écart se creuse encore sur des fichiers plus
-gros.
+**Memory: ~30–40× less (≈1.4 GB → ~40 MB, −97%).** The old version loaded the
+entire file into RAM (OpenQVD by cloning the bytes) then materialized all rows —
+a roughly constant cost ≈1.4 GB regardless of the query, **growing with the file
+size**. Streaming stays **bounded** (symbol tables + one chunk), independent of
+the number of rows; the gap widens further on larger files.
 
-**Temps : ~3× plus lent.** Le compromis assumé du streaming. Le surcoût vient
-surtout du décodage *eager* de **toutes** les tables de symboles par `qvdrs`
-(le parcours de l'index par chunks, lui, est rapide) — piste d'optimisation future.
+**Time: ~3× slower.** The accepted trade-off of streaming. The overhead comes
+mainly from the *eager* decoding of **all** symbol tables by `qvdrs`
+(traversing the index in chunks is itself fast) — a future optimization avenue.
 
 ## Structure
 
-| Fichier | Rôle |
+| File | Role |
 |---|---|
-| `src/lib.rs` | Entrypoint C-API + VTab `read_qvd` (plomberie DuckDB, streaming) |
-| `src/qvd.rs` | Lecture streaming `qvdrs` : schéma, typage, scan par chunks, conversions + tests |
-| `src/wasm_lib.rs` | Réexport pour la cible Wasm (staticlib) |
-| `Cargo.toml` | Dépendances (`duckdb`, + `openqvd`/`arrow` à activer) |
-| `Makefile` | Build C-API (`make debug`/`release`) + cibles cargo rapides |
-| `test/sql/read_qvd.test` | Test SQLLogicTest de fumée |
+| `src/lib.rs` | C-API entrypoint + `read_qvd` VTab (DuckDB plumbing, streaming) |
+| `src/qvd.rs` | `qvdrs` streaming read: schema, typing, chunked scan, conversions + tests |
+| `src/wasm_lib.rs` | Re-export for the Wasm target (staticlib) |
+| `Cargo.toml` | Dependencies (`duckdb`, + `openqvd`/`arrow` to enable) |
+| `Makefile` | C-API build (`make debug`/`release`) + fast cargo targets |
+| `test/sql/read_qvd.test` | SQLLogicTest smoke test |
 
 ## Build
 
-### Itération rapide (bibliothèque native)
+### Fast iteration (native library)
 
 ```sh
-make cargo-build        # ou : cargo build
+make cargo-build        # or: cargo build
 ```
 
-> Le build de la feature `loadable-extension` du crate `duckdb` génère des
-> bindings et peut nécessiter **libclang** (bindgen) installé sur la machine.
+> Building the `loadable-extension` feature of the `duckdb` crate generates
+> bindings and may require **libclang** (bindgen) installed on the machine.
 
-### Extension chargeable (`.duckdb_extension`)
+### Loadable extension (`.duckdb_extension`)
 
-Chemin recommandé (compile + appose le footer de métadonnées, sans venv) :
+Recommended path (compiles + appends the metadata footer, without a venv):
 
 ```sh
 git clone --depth 1 https://github.com/duckdb/extension-ci-tools.git
 ./scripts/build-extension.sh        # → build/qvd.duckdb_extension
 ```
 
-Le script détecte la plateforme et la **version du `duckdb` local**. Pour l'ABI
-C_STRUCT_UNSTABLE, DuckDB exige que la version stampée corresponde exactement à
-l'hôte ; le crate vise l'API C v1.5.2 et les patches v1.5.x partagent la même
-struct (testé : chargé dans **v1.5.3**).
+The script detects the platform and the **version of the local `duckdb`**. For
+the C_STRUCT_UNSTABLE ABI, DuckDB requires the stamped version to match the host
+exactly; the crate targets the C API v1.5.2 and the v1.5.x patches share the same
+struct (tested: loaded in **v1.5.3**).
 
-Chargement (extension non signée) :
+Loading (unsigned extension):
 
 ```sh
 duckdb -unsigned -c "LOAD 'build/qvd.duckdb_extension'; \
   SELECT * FROM read_qvd('QVD-Examples/Ventes.qvd');"
 ```
 
-> Le pipeline officiel `make bootstrap && make configure && make debug` reste
-> disponible, mais `make configure` installe un venv Python (duckdb + runner
-> sqllogictest) qui peut échouer selon la version de Python.
+> The official pipeline `make bootstrap && make configure && make debug` remains
+> available, but `make configure` installs a Python venv (duckdb + sqllogictest
+> runner) which may fail depending on the Python version.
 
 ## Tests
 
 ```sh
-cargo +1.95.0 test --lib    # test d'intégration : génère un QVD puis le relit
+cargo +1.95.0 test --lib    # integration test: generates a QVD then reads it back
 ```
 
-Le test (dans [`src/qvd.rs`](src/qvd.rs)) couvre entiers, flottants, texte,
-`NULL` et un champ « dual » typé DATE. `--lib` cible la lib (l'« example » Wasm
-a une contrainte de modules distincte).
+The test (in [`src/qvd.rs`](src/qvd.rs)) covers integers, floats, text, `NULL`
+and a "dual" field typed as DATE. `--lib` targets the lib (the Wasm "example"
+has a distinct module constraint).
 
-Pour tester sur de vrais QVD : déposer des fichiers dans `test/data/` et adapter
+To test on real QVDs: drop files into `test/data/` and adapt
 [`test/sql/read_qvd.test`](test/sql/read_qvd.test).
 
-## Feuille de route
+## Roadmap
 
-- [x] Lecture `read_qvd('fichier.qvd')` avec typage BIGINT/DOUBLE/VARCHAR + NULL.
-- [x] Types temporels natifs `DATE`/`TIMESTAMP`/`TIME`/`INTERVAL` (séries Qlik converties).
-- [x] Projection pushdown via `from_path_projected` (seules les colonnes utiles décodées).
-- [x] Glob `read_qvd('data/*.qvd')` (lignes concaténées, résolution par nom).
-- [x] Écriture `COPY ... TO ... (FORMAT qvd)` (copy function FFI ; round-trip vérifié).
-- [x] Préserver les noms de colonnes à l'écriture (option `FIELD_NAMES`).
-- [x] Écriture des `DECIMAL` (toutes largeurs i16/i32/i64/i128 → DOUBLE).
-- [x] Écriture `TIME`/`INTERVAL` (round-trip temporel complet vérifié).
-- [x] Import `COPY table FROM 'x.qvd'` (table function FFI ; round-trip vérifié).
+- [x] Reading `read_qvd('file.qvd')` with BIGINT/DOUBLE/VARCHAR typing + NULL.
+- [x] Native temporal types `DATE`/`TIMESTAMP`/`TIME`/`INTERVAL` (Qlik serials converted).
+- [x] Projection pushdown via `from_path_projected` (only useful columns decoded).
+- [x] Glob `read_qvd('data/*.qvd')` (concatenated rows, resolution by name).
+- [x] Writing `COPY ... TO ... (FORMAT qvd)` (FFI copy function; round-trip verified).
+- [x] Preserve column names on write (`FIELD_NAMES` option).
+- [x] Writing `DECIMAL`s (all widths i16/i32/i64/i128 → DOUBLE).
+- [x] Writing `TIME`/`INTERVAL` (full temporal round-trip verified).
+- [x] Import `COPY table FROM 'x.qvd'` (FFI table function; round-trip verified).
 
-## Licence
+## License
 
-Apache-2.0, comme OpenQVD.
+Apache-2.0, like OpenQVD.
