@@ -330,19 +330,23 @@ unsafe extern "C" fn copy_finalize(info: ffi::duckdb_copy_function_finalize_info
         &*(ffi::duckdb_copy_function_finalize_get_global_state(info) as *const CopyGlobalState);
 
     let result: Result<(), String> = (|| {
-        let columns = state.columns.lock().unwrap();
-        let cols: Vec<Column> = columns
-            .iter()
+        // Sort les valeurs accumulées sans les copier (laisse des Vec vides) et
+        // relâche le lock avant l'encodage, qui n'a plus besoin de l'état partagé.
+        let taken = {
+            let mut columns = state.columns.lock().unwrap();
+            std::mem::take(&mut *columns)
+        };
+        let cols: Vec<Column> = taken
+            .into_iter()
             .enumerate()
             .map(|(i, vals)| {
-                let mut col = Column::new(state.names[i].clone(), vals.clone());
+                let mut col = Column::new(state.names[i].clone(), vals); // move, plus de clone
                 col.tags = state.kinds[i].tags();
                 col
             })
             .collect();
         let table = WriteTable::new("qvd", cols).map_err(|e| e.to_string())?;
-        let bytes = table.to_bytes().map_err(|e| e.to_string())?;
-        std::fs::write(&state.path, bytes).map_err(|e| e.to_string())?;
+        table.write_to_path(&state.path).map_err(|e| e.to_string())?;
         Ok(())
     })();
 
