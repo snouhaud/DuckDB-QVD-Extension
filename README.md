@@ -172,11 +172,13 @@ make cargo-build        # or: cargo build
 ### Loadable extension (`.duckdb_extension`)
 
 This project uses the official DuckDB **community build template** from
-[`extension-ci-tools`](https://github.com/duckdb/extension-ci-tools) — the same
-flow the community-extensions infrastructure runs:
+[`extension-ci-tools`](https://github.com/duckdb/extension-ci-tools), vendored as
+a **git submodule pinned to the `v1.5.3` branch** (matching `TARGET_DUCKDB_VERSION`)
+— the same flow the community-extensions infrastructure runs. Clone with
+`git clone --recurse-submodules …`, or initialise the submodule after the fact:
 
 ```sh
-make bootstrap          # clones extension-ci-tools (once)
+make bootstrap          # git submodule update --init --recursive (once)
 make configure          # creates a Python venv (duckdb + sqllogictest runner)
 make debug              # → build/debug/qvd.duckdb_extension
 # make release          # → build/release/qvd.duckdb_extension

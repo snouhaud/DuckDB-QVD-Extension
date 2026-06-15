@@ -12,15 +12,24 @@ TARGET_DUCKDB_VERSION=v1.5.3
 
 all: configure debug
 
-# Fetch the shared CI tooling (venv DuckDB + SQLLogicTest runner).
-# Run once before `make configure`.
+# Initialise the extension-ci-tools submodule (the community build template).
+# Already present after `git clone --recurse-submodules`; this fetches/refreshes
+# it otherwise (e.g. a non-recursive clone). Run once before `make configure`.
 .PHONY: bootstrap
 bootstrap:
-	git clone --depth 1 https://github.com/duckdb/extension-ci-tools.git
+	git submodule update --init --recursive
 
-# Reusable makefiles from extension-ci-tools (the community build template).
+# Reusable makefiles from extension-ci-tools (pinned submodule). Guarded: if the
+# submodule isn't checked out yet, print a clear hint instead of GNU make's
+# cryptic "No rule to make target ...Makefile" error from the `include`. The
+# `bootstrap` target above stays reachable so a single command bootstraps it.
+CI_TOOLS_MK := extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
+ifeq (,$(wildcard $(CI_TOOLS_MK)))
+$(warning extension-ci-tools submodule missing — run: make bootstrap)
+else
 include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
 include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
+endif
 
 configure: venv platform extension_version
 

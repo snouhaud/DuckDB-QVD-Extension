@@ -1,13 +1,11 @@
 /target
 /build
 /configure
-/extension-ci-tools
 /duckdb
 *.duckdb_extension
 .venv
 __pycache__/
 .DS_Store
-extension-ci-tools/
 
 # Local only: lives in the duckdb/community-extensions repo, not here.
 /community-extension/
