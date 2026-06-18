@@ -7,8 +7,13 @@ EXTENSION_NAME=qvd
 # forward compatibility is broken). Required: duckdb-rs relies on the unstable C API.
 USE_UNSTABLE_C_API=1
 
-# Target DuckDB version (matches the community-extensions build version).
-TARGET_DUCKDB_VERSION=v1.5.3
+# Target DuckDB version, derived from the pinned `duckdb` crate in Cargo.toml.
+# That crate is the single source of truth: its version encodes the DuckDB
+# version of the unstable C ABI (e.g. 1.10504.0 -> v1.5.4), and the binary only
+# loads on that exact version. Bumping the crate in Cargo.toml propagates here,
+# so the two can never drift. Falls back to v0.0.1 (ci-tools default) if unset.
+DUCKDB_RS_ENC := $(shell sed -n 's/^duckdb = .*version = "=1\.\([0-9]\{5\}\)\.[0-9]*".*/\1/p' Cargo.toml)
+TARGET_DUCKDB_VERSION := v$(shell v=$(DUCKDB_RS_ENC); echo "$$((v/10000)).$$((v/100%100)).$$((v%100))")
 
 all: configure debug
 

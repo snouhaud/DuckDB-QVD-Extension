@@ -110,7 +110,7 @@ fn write_column(output: &mut DataChunkHandle, j: usize, kind: Kind, cells: &[Cel
         }
         Kind::Int | Kind::Timestamp | Kind::Time => {
             {
-                let s = v.as_mut_slice::<i64>();
+                let s = unsafe { v.as_mut_slice::<i64>() };
                 for (r, c) in cells.iter().enumerate() {
                     s[r] = if let Cell::I64(x) = c { *x } else { 0 };
                 }
@@ -119,7 +119,7 @@ fn write_column(output: &mut DataChunkHandle, j: usize, kind: Kind, cells: &[Cel
         }
         Kind::Float => {
             {
-                let s = v.as_mut_slice::<f64>();
+                let s = unsafe { v.as_mut_slice::<f64>() };
                 for (r, c) in cells.iter().enumerate() {
                     s[r] = if let Cell::F64(x) = c { *x } else { 0.0 };
                 }
@@ -128,7 +128,7 @@ fn write_column(output: &mut DataChunkHandle, j: usize, kind: Kind, cells: &[Cel
         }
         Kind::Date => {
             {
-                let s = v.as_mut_slice::<i32>();
+                let s = unsafe { v.as_mut_slice::<i32>() };
                 for (r, c) in cells.iter().enumerate() {
                     s[r] = if let Cell::I32(x) = c { *x } else { 0 };
                 }
@@ -137,7 +137,7 @@ fn write_column(output: &mut DataChunkHandle, j: usize, kind: Kind, cells: &[Cel
         }
         Kind::Interval => {
             {
-                let s = v.as_mut_slice::<qvd::IntervalVal>();
+                let s = unsafe { v.as_mut_slice::<qvd::IntervalVal>() };
                 for (r, c) in cells.iter().enumerate() {
                     s[r] = match c {
                         Cell::Interval(x) => *x,
