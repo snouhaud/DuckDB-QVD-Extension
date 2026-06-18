@@ -1410,21 +1410,21 @@ dependencies = [
 
 [[package]]
 name = "qvd"
-version = "0.1.0"
-dependencies = [
- "duckdb",
- "glob",
- "openqvd",
- "qvd 0.7.1",
-]
-
-[[package]]
-name = "qvd"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8272684d9dce6b8fd98c32fe6dfb79454bed26a7ca86321866ad07e34b5fb048"
 dependencies = [
  "napi-build",
+]
+
+[[package]]
+name = "qvd"
+version = "1.0.0"
+dependencies = [
+ "duckdb",
+ "glob",
+ "openqvd",
+ "qvd 0.7.1",
 ]
 
 [[package]]
