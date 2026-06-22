@@ -14,15 +14,17 @@ COPY sales FROM 'output.qvd' (FORMAT qvd);
 ## Project status
 
 **Reading is functional, verified in live DuckDB (v1.5.3).** The extension
-registers itself, declares the `read_qvd(VARCHAR)` table function, and reads
-QVD files in **streaming dictionary** mode via `qvdrs`: a DuckDB type is inferred
-per field (at `bind`), then the column symbol tables (the dictionary of distinct
-values) are decoded once and each **projected symbol is converted to a typed value
-only once**; the index block is read **in chunks of 2048 rows**
-(`open_qvd_stream`/`next_chunk_indices`) and rows are emitted by index lookup, one
-file open at a time. Memory is **bounded** (≈ symbol tables + one chunk of
-indices), regardless of the number of rows — no more materializing all rows, and
-no per-row reconversion.
+registers itself, declares the `read_qvd(VARCHAR)` table function, and reads QVD
+files in **streaming projected** mode via `qvdrs`' low-level primitives: a DuckDB
+type is inferred per field from the header alone (at `bind`), then — for the
+**projected columns only** — their symbol tables (dictionary of distinct values)
+are decoded and each symbol is converted to a typed value once. The bit-packed
+index block is read **in chunks of 2048 rows** and, for each record, only the
+**projected fields' bits** are extracted (`read_field_index`); rows are emitted by
+index lookup, one file open at a time. Memory is **bounded** (≈ projected symbol
+tables + one chunk of index bytes), regardless of the number of rows — no
+materializing, no per-row reconversion, and **work scales with the number of
+projected columns, not the total**.
 The `DATE`/`BIGINT`/`VARCHAR` columns behave like real SQL types (filters,
 `EXTRACT`, aggregates). The logic is isolated in [`src/qvd.rs`](src/qvd.rs) and
 covered by tests (`cargo test --lib`).
@@ -122,11 +124,12 @@ restored; round-trip `COPY TO` → `COPY FROM` verified.
 
 - Typing driven by Qlik tags; a QVD without tags falls back to `<Type>` and then
   `VARCHAR` by default (files produced by Qlik are always tagged).
-- **Streaming dictionary read with bounded memory** (≈ symbol tables + one chunk
-  of indices). `qvdrs` still decodes **all** the symbol tables in the file (no
-  projection at the symbol level); only the projected columns are converted and
-  emitted. The bit-packed index block is also traversed in full (a QVD format
-  trait) regardless of how many columns are projected.
+- **Streaming projected read with bounded memory** (≈ projected symbol tables +
+  one chunk of index bytes). Only the **projected** columns' symbols are decoded
+  and only the projected fields' bits are extracted per record — work scales with
+  the projection, not the total column count. The index block's **bytes** are still
+  read in full (fields are bit-interleaved in each record — a QVD format trait), but
+  warm that is cheap; the former bottleneck was extracting all columns' bits.
 - **Writing** (`COPY TO`) still accumulates all rows in memory (OpenQVD writer).
 - Local glob only (no DuckDB file system: neither httpfs nor S3).
 
@@ -134,34 +137,30 @@ restored; round-trip `COPY TO` → `COPY FROM` verified.
 
 Measured on `flights.QVD` (**439 MB, 10 million rows, 49 columns**),
 DuckDB v1.5.4, **release builds**, warm page cache, wall time + peak RSS via
-`/usr/bin/time -l` (macOS, Apple Silicon). The **dictionary** reader (current)
-converts each projected symbol once and emits rows by index lookup; the previous
-**per-row** streaming reader (`next_chunk`) rebuilt a value for every column of
-every row:
+`/usr/bin/time -l` (macOS, Apple Silicon). The **projected** reader (current)
+extracts only the projected fields' bits per record; the previous reader decoded
+**all 49 columns'** indices for every row regardless of the projection:
 
-| Query | per-row streaming (before) | **dictionary (current)** |
-|---|---|---|
-| `SELECT sum(DepDelay)` (1 col) | 7.6 s · 37 MB | **2.9 s · 31 MB** |
-| 3 text cols `count(DISTINCT …)` | 8.6 s · 49 MB | **4.1 s · 39 MB** |
-| `SELECT count(*)` | 7.3 s · 37 MB | **2.9 s · 31 MB** |
+| Query | all-columns index decode (before) | **projected (current)** | speedup |
+|---|---|---|---|
+| `SELECT sum(DepDelay)` (1 col) | 2.9 s · 31 MB | **0.18 s · 29 MB** | **16×** |
+| `SELECT count(*)` | 3.0 s · 31 MB | **0.10 s · 29 MB** | **30×** |
+| 3 text cols `count(DISTINCT …)` | 4.2 s · 39 MB | **1.6 s · 37 MB** | 2.7× |
+| 49 columns (`max(COLUMNS(*))`) | 10.7 s | 10.2 s | ≈ same |
 
-**~2.6–2.9× faster, same bounded memory** (31–39 MB). The win comes from
-converting each distinct symbol once instead of once per row — and from reading
-raw indices (`next_chunk_indices`) rather than rebuilding a value for every
-column of every row. Memory stays bounded (symbol tables + one chunk of indices),
-independent of the number of rows. This essentially recovers the speed of a fully
-materialized read (which cost ≈1.4 GB) without giving up bounded memory.
-
-The remaining floor (~2.6 s) is the *eager* decoding of **all** symbol tables by
-`qvdrs` — a future optimization avenue would be projected/lazy symbol decoding
-upstream.
+**16–30× faster on narrow projections** (the common analytical case), same
+bounded memory (~29–37 MB), and no regression on full-table reads. The former
+bottleneck was decoding all 49 columns' bit-fields per row (≈ 490 M extractions
+for 10 M rows) even for a single-column query; the projected reader extracts only
+what is asked for. Symbol-table decoding turned out to be negligible (~0.01 s);
+`count(*)` is now served almost entirely from the header.
 
 ## Structure
 
 | File | Role |
 |---|---|
 | `src/lib.rs` | C-API entrypoint + `read_qvd` VTab (DuckDB plumbing, streaming) |
-| `src/qvd.rs` | `qvdrs` streaming dictionary read: schema, typing, chunked scan, conversions + tests |
+| `src/qvd.rs` | `qvdrs` streaming projected read: header/typing, projected symbol + index decode, conversions + tests |
 | `src/wasm_lib.rs` | Re-export for the Wasm target (staticlib) |
 | `Cargo.toml` | Dependencies (`duckdb`, + `openqvd`/`arrow` to enable) |
 | `Makefile` | C-API build (`make debug`/`release`) + fast cargo targets |
