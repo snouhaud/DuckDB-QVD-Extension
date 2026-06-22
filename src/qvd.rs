@@ -1,8 +1,13 @@
-//! Lecture du format QVD via le crate `qvdrs` (reader **streaming**).
+//! Lecture du format QVD via le crate `qvdrs`, en **streaming dictionnaire**.
 //!
-//! `qvdrs` lit le fichier en chunks (`open_qvd_stream`/`next_chunk`) sans charger
-//! l'index en mémoire : on garde un fichier ouvert à la fois et on décode ~2048
-//! lignes par appel, ce qui borne la mémoire (≈ tables de symboles + un chunk).
+//! Le QVD est un format colonne dictionnaire-encodé : chaque colonne a une table
+//! de **symboles** (valeurs distinctes) et un bloc d'**index** vers ces symboles.
+//! On ouvre le fichier en flux (`open_qvd_stream`) — les tables de symboles sont
+//! décodées une fois, l'index est lu par chunks (`next_chunk_indices`, ~2048
+//! lignes). Chaque symbole projeté n'est **converti qu'une seule fois** par fichier
+//! (le dictionnaire de `Cell`) ; les lignes sont ensuite émises par simple lookup
+//! d'index. Mémoire bornée (≈ tables de symboles + un chunk d'index), et on évite
+//! de reconvertir chaque ligne (gain net sur colonnes à faible cardinalité).
 //!
 //! # Correspondance des types
 //!
@@ -29,7 +34,7 @@ use std::sync::Mutex;
 
 use duckdb::core::LogicalTypeId;
 use qvdrs::header::QvdFieldHeader;
-use qvdrs::{open_qvd_stream, QvdChunk, QvdSymbol, QvdValue};
+use qvdrs::{open_qvd_stream, QvdSymbol, QvdValue};
 
 /// Reader streaming concret (un fichier ouvert).
 type Reader = qvdrs::QvdStreamReader<std::io::BufReader<std::fs::File>>;
@@ -82,6 +87,7 @@ impl Kind {
 
 /// Valeur convertie, prête à écrire dans un vecteur DuckDB. Mutualise la logique
 /// de conversion entre `lib.rs` (FlatVector) et `copy_from.rs` (FFI brut).
+#[derive(Clone)]
 pub(crate) enum Cell {
     I64(i64),
     F64(f64),
@@ -116,6 +122,7 @@ struct ScanState {
     file_idx: usize,
     reader: Option<Reader>,
     positions: Vec<Option<usize>>, // colonne projetée -> index du champ dans le fichier courant
+    dicts: Vec<Vec<Cell>>,         // colonne projetée -> symboles convertis (1× par fichier)
     countstar_emitted: usize,
 }
 
@@ -123,8 +130,8 @@ struct ScanState {
 pub(crate) enum Pull {
     /// `COUNT(*)` : `n` lignes sans aucune colonne.
     Rows(usize),
-    /// Données : positions (colonne projetée -> champ du fichier) + chunk colonne-major.
-    Chunk { positions: Vec<Option<usize>>, chunk: QvdChunk },
+    /// Données : colonnes projetées déjà converties (un chunk, possédées).
+    Cells { columns: Vec<Vec<Cell>> },
     /// Scan terminé.
     Done,
 }
@@ -162,6 +169,7 @@ impl QvdScan {
                 file_idx: 0,
                 reader: None,
                 positions: Vec::new(),
+                dicts: Vec::new(),
                 countstar_emitted: 0,
             }),
         })
@@ -173,8 +181,9 @@ impl QvdScan {
     }
 
     /// Tire le prochain paquet de lignes (un chunk d'un fichier), en traversant
-    /// les fichiers du glob. L'état avance sous verrou ; les données rendues
-    /// sont possédées (écriture hors verrou).
+    /// les fichiers du glob. À l'ouverture d'un fichier, on convertit chaque
+    /// symbole une fois (le dictionnaire) ; chaque chunk n'est plus qu'un lookup
+    /// d'index. L'état avance sous verrou ; les données rendues sont possédées.
     pub(crate) fn pull(&self) -> Result<Pull, Box<dyn Error>> {
         let mut st = self.state.lock().unwrap();
 
@@ -195,20 +204,55 @@ impl QvdScan {
                 }
                 let reader = open_qvd_stream(&self.paths[st.file_idx])?;
                 // Résolution par nom dans le fichier courant (None si absent → NULL).
-                st.positions = self
+                let positions: Vec<Option<usize>> = self
                     .needed_names
                     .iter()
                     .map(|nm| reader.header.fields.iter().position(|f| &f.field_name == nm))
                     .collect();
+                // Dictionnaire : convertir chaque symbole une seule fois par colonne.
+                let dicts: Vec<Vec<Cell>> = positions
+                    .iter()
+                    .enumerate()
+                    .map(|(j, p)| match p {
+                        Some(fi) => reader.symbols[*fi]
+                            .iter()
+                            .map(|s| convert(self.needed_kinds[j], &QvdValue::Symbol(s.clone())))
+                            .collect(),
+                        None => Vec::new(),
+                    })
+                    .collect();
+                st.positions = positions;
+                st.dicts = dicts;
                 st.reader = Some(reader);
             }
 
-            match st.reader.as_mut().unwrap().next_chunk(VECTOR_SIZE)? {
-                Some(chunk) if chunk.num_rows > 0 => {
-                    return Ok(Pull::Chunk { positions: st.positions.clone(), chunk });
+            // Index bruts du chunk (sans résolution des symboles) pour toutes les
+            // colonnes du fichier ; on ne matérialise que les colonnes projetées.
+            let next = st.reader.as_mut().unwrap().next_chunk_indices(VECTOR_SIZE)?;
+            match next {
+                Some((cols, n, _start)) if n > 0 => {
+                    let columns: Vec<Vec<Cell>> = (0..self.needed_kinds.len())
+                        .map(|j| match st.positions[j] {
+                            Some(fi) => {
+                                let dict = &st.dicts[j];
+                                cols[fi]
+                                    .iter()
+                                    .map(|&idx| {
+                                        if idx < 0 || idx as usize >= dict.len() {
+                                            Cell::Null
+                                        } else {
+                                            dict[idx as usize].clone()
+                                        }
+                                    })
+                                    .collect()
+                            }
+                            None => vec![Cell::Null; n],
+                        })
+                        .collect();
+                    return Ok(Pull::Cells { columns });
                 }
                 _ => {
-                    // Fichier épuisé → suivant (drop le reader courant).
+                    // Fichier épuisé → suivant (drop le reader + son dictionnaire).
                     st.reader = None;
                     st.file_idx += 1;
                 }
@@ -387,8 +431,7 @@ mod tests {
         }
     }
 
-    /// Draine un scan streaming en colonnes typées (équivalent test de la
-    /// matérialisation), pour pouvoir asserter sur les valeurs.
+    /// Draine un scan en colonnes typées, pour pouvoir asserter sur les valeurs.
     fn collect(paths: &[String], names: &[String], kinds: &[Kind], indices: &[usize]) -> (Vec<TestCol>, usize) {
         let scan = QvdScan::new(paths, names, kinds, indices).unwrap();
         let out_kinds: Vec<Kind> = indices.iter().map(|&i| kinds[i]).collect();
@@ -398,16 +441,11 @@ mod tests {
             match scan.pull().unwrap() {
                 Pull::Done => break,
                 Pull::Rows(n) => total += n,
-                Pull::Chunk { positions, chunk } => {
-                    total += chunk.num_rows;
+                Pull::Cells { columns } => {
+                    total += columns.first().map_or(0, |c| c.len());
                     for (j, col) in cols.iter_mut().enumerate() {
-                        let src = positions[j].map(|p| &chunk.columns[p]);
-                        for r in 0..chunk.num_rows {
-                            let cell = match src {
-                                Some(c) => convert(out_kinds[j], &c[r]),
-                                None => Cell::Null,
-                            };
-                            col.push(cell);
+                        for cell in columns[j].iter() {
+                            col.push(cell.clone());
                         }
                     }
                 }

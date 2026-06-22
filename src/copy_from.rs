@@ -85,19 +85,12 @@ unsafe extern "C" fn cf_func(info: ffi::duckdb_function_info, output: ffi::duckd
     match scan.pull() {
         Ok(Pull::Done) => ffi::duckdb_data_chunk_set_size(output, 0),
         Ok(Pull::Rows(n)) => ffi::duckdb_data_chunk_set_size(output, n as u64),
-        Ok(Pull::Chunk { positions, chunk }) => {
+        Ok(Pull::Cells { columns }) => {
             let kinds = scan.output_kinds();
-            let n = chunk.num_rows;
+            let n = columns.first().map_or(0, |c| c.len());
             for (j, &kind) in kinds.iter().enumerate() {
                 let vector = ffi::duckdb_data_chunk_get_vector(output, j as u64);
-                let src = positions[j].map(|p| &chunk.columns[p]);
-                let cells: Vec<Cell> = (0..n)
-                    .map(|r| match src {
-                        Some(c) => qvd::convert(kind, &c[r]),
-                        None => Cell::Null,
-                    })
-                    .collect();
-                write_col_raw(vector, kind, &cells);
+                write_col_raw(vector, kind, &columns[j]);
             }
             ffi::duckdb_data_chunk_set_size(output, n as u64);
         }
