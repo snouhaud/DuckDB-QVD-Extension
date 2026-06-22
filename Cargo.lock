@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "qvd"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "duckdb",
  "glob",
