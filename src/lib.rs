@@ -70,18 +70,12 @@ impl VTab for ReadQvdVTab {
         match scan.pull()? {
             Pull::Done => output.set_len(0),
             Pull::Rows(n) => output.set_len(n), // COUNT(*) : lignes sans colonnes
-            Pull::Chunk { positions, chunk } => {
+            Pull::Cells { columns } => {
+                // Colonnes déjà converties par dictionnaire : copie directe.
                 let kinds = scan.output_kinds();
-                let n = chunk.num_rows;
+                let n = columns.first().map_or(0, |c| c.len());
                 for (j, &kind) in kinds.iter().enumerate() {
-                    let src = positions[j].map(|p| &chunk.columns[p]);
-                    let cells: Vec<Cell> = (0..n)
-                        .map(|r| match src {
-                            Some(c) => qvd::convert(kind, &c[r]),
-                            None => Cell::Null,
-                        })
-                        .collect();
-                    write_column(output, j, kind, &cells);
+                    write_column(output, j, kind, &columns[j]);
                 }
                 output.set_len(n);
             }

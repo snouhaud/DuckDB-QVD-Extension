@@ -15,10 +15,14 @@ COPY sales FROM 'output.qvd' (FORMAT qvd);
 
 **Reading is functional, verified in live DuckDB (v1.5.3).** The extension
 registers itself, declares the `read_qvd(VARCHAR)` table function, and reads
-QVD files in **streaming** mode via `qvdrs`: a DuckDB type is inferred per field
-(at `bind`), then data is decoded **in chunks of 2048 rows** (`open_qvd_stream`/
-`next_chunk`), one file open at a time. Memory is **bounded** (≈ symbol tables +
-one chunk), regardless of the number of rows — no more materializing all rows.
+QVD files in **streaming dictionary** mode via `qvdrs`: a DuckDB type is inferred
+per field (at `bind`), then the column symbol tables (the dictionary of distinct
+values) are decoded once and each **projected symbol is converted to a typed value
+only once**; the index block is read **in chunks of 2048 rows**
+(`open_qvd_stream`/`next_chunk_indices`) and rows are emitted by index lookup, one
+file open at a time. Memory is **bounded** (≈ symbol tables + one chunk of
+indices), regardless of the number of rows — no more materializing all rows, and
+no per-row reconversion.
 The `DATE`/`BIGINT`/`VARCHAR` columns behave like real SQL types (filters,
 `EXTRACT`, aggregates). The logic is isolated in [`src/qvd.rs`](src/qvd.rs) and
 covered by tests (`cargo test --lib`).
@@ -118,41 +122,46 @@ restored; round-trip `COPY TO` → `COPY FROM` verified.
 
 - Typing driven by Qlik tags; a QVD without tags falls back to `<Type>` and then
   `VARCHAR` by default (files produced by Qlik are always tagged).
-- **Streaming read with bounded memory** (≈ symbol tables + one chunk).
-  However, `qvdrs` decodes **all** the symbol tables in the file (no projection
-  at the symbol level); projection is applied at emission.
+- **Streaming dictionary read with bounded memory** (≈ symbol tables + one chunk
+  of indices). `qvdrs` still decodes **all** the symbol tables in the file (no
+  projection at the symbol level); only the projected columns are converted and
+  emitted. The bit-packed index block is also traversed in full (a QVD format
+  trait) regardless of how many columns are projected.
 - **Writing** (`COPY TO`) still accumulates all rows in memory (OpenQVD writer).
 - Local glob only (no DuckDB file system: neither httpfs nor S3).
 
 ## Performance (reading)
 
-Measured on `flights.QVD` (**460 MB, 10 million rows, ~50 columns**),
-DuckDB v1.5.3, **release builds**, peak RSS via `/usr/bin/time -l` (macOS,
-Apple Silicon). Comparison between the current version (`qvdrs`, streaming) and
-the previous one (OpenQVD, everything materialized):
+Measured on `flights.QVD` (**439 MB, 10 million rows, 49 columns**),
+DuckDB v1.5.4, **release builds**, warm page cache, wall time + peak RSS via
+`/usr/bin/time -l` (macOS, Apple Silicon). The **dictionary** reader (current)
+converts each projected symbol once and emits rows by index lookup; the previous
+**per-row** streaming reader (`next_chunk`) rebuilt a value for every column of
+every row:
 
-| Query | OpenQVD (before) | `qvdrs` (streaming) |
+| Query | per-row streaming (before) | **dictionary (current)** |
 |---|---|---|
-| `SELECT count(*)` | 2 s · **1520 MB** | 7 s · **37 MB** |
-| `SELECT count(DISTINCT Origin)` | 3 s · **1445 MB** | 8 s · **45 MB** |
-| `SELECT max(Distance)` | 2 s · **1440 MB** | 8 s · **38 MB** |
+| `SELECT sum(DepDelay)` (1 col) | 7.6 s · 37 MB | **2.9 s · 31 MB** |
+| 3 text cols `count(DISTINCT …)` | 8.6 s · 49 MB | **4.1 s · 39 MB** |
+| `SELECT count(*)` | 7.3 s · 37 MB | **2.9 s · 31 MB** |
 
-**Memory: ~30–40× less (≈1.4 GB → ~40 MB, −97%).** The old version loaded the
-entire file into RAM (OpenQVD by cloning the bytes) then materialized all rows —
-a roughly constant cost ≈1.4 GB regardless of the query, **growing with the file
-size**. Streaming stays **bounded** (symbol tables + one chunk), independent of
-the number of rows; the gap widens further on larger files.
+**~2.6–2.9× faster, same bounded memory** (31–39 MB). The win comes from
+converting each distinct symbol once instead of once per row — and from reading
+raw indices (`next_chunk_indices`) rather than rebuilding a value for every
+column of every row. Memory stays bounded (symbol tables + one chunk of indices),
+independent of the number of rows. This essentially recovers the speed of a fully
+materialized read (which cost ≈1.4 GB) without giving up bounded memory.
 
-**Time: ~3× slower.** The accepted trade-off of streaming. The overhead comes
-mainly from the *eager* decoding of **all** symbol tables by `qvdrs`
-(traversing the index in chunks is itself fast) — a future optimization avenue.
+The remaining floor (~2.6 s) is the *eager* decoding of **all** symbol tables by
+`qvdrs` — a future optimization avenue would be projected/lazy symbol decoding
+upstream.
 
 ## Structure
 
 | File | Role |
 |---|---|
 | `src/lib.rs` | C-API entrypoint + `read_qvd` VTab (DuckDB plumbing, streaming) |
-| `src/qvd.rs` | `qvdrs` streaming read: schema, typing, chunked scan, conversions + tests |
+| `src/qvd.rs` | `qvdrs` streaming dictionary read: schema, typing, chunked scan, conversions + tests |
 | `src/wasm_lib.rs` | Re-export for the Wasm target (staticlib) |
 | `Cargo.toml` | Dependencies (`duckdb`, + `openqvd`/`arrow` to enable) |
 | `Makefile` | C-API build (`make debug`/`release`) + fast cargo targets |
