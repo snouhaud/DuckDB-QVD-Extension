@@ -12,7 +12,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOOLCHAIN="${RUST_TOOLCHAIN:-1.95.0}"
 EXT_NAME="qvd"
-EXT_VERSION="1.0.0"
+EXT_VERSION="1.0.1"
 
 # 1. Compiler la bibliothèque native.
 ( cd "$ROOT" && cargo "+$TOOLCHAIN" build )
