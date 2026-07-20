@@ -133,6 +133,84 @@ restored; round-trip `COPY TO` → `COPY FROM` verified.
 - **Writing** (`COPY TO`) still accumulates all rows in memory (OpenQVD writer).
 - Local glob only (no DuckDB file system: neither httpfs nor S3).
 
+## Important limitations and behaviour notes
+
+### Writing memory usage
+
+`COPY ... TO ... (FORMAT qvd)` accumulates **all rows in memory** before writing
+(`src/copy.rs`). This is a limitation of the underlying OpenQVD writer, not of
+DuckDB. For small and medium files this is fine, but for very large outputs you
+should expect memory consumption proportional to the total row count × column
+count. If you hit memory limits, split the output into smaller chunks (for
+example with `LIMIT`/`OFFSET` or by partition) or export to another format.
+
+### Column names in `COPY ... TO`
+
+The DuckDB C copy-function API does **not expose column names**, so by default
+the QVD fields are named `field0`, `field1`, `field2`, … regardless of the source
+column names. Use the `FIELD_NAMES` option to preserve meaningful names. Both
+syntaxes are accepted:
+
+```sql
+COPY (SELECT id, amount, day FROM sales)
+  TO 'export.qvd' (FORMAT qvd, FIELD_NAMES (id, amount, day));
+
+COPY (SELECT id, amount, day FROM sales)
+  TO 'export.qvd' (FORMAT qvd, FIELD_NAMES ['id', 'amount', 'day']);
+```
+
+A common pattern is to query the column names from the result metadata and build
+the option dynamically. This works for a table, a CTE, or any query expression:
+
+```sql
+-- build the field-name array from the output schema of the query
+SELECT list(column_name)
+FROM (DESCRIBE SELECT * FROM sales);
+-- → [id, amount, sale_date]
+
+-- then use that list in the COPY statement
+COPY (SELECT * FROM sales)
+  TO 'sales.qvd' (FORMAT qvd, FIELD_NAMES (SELECT list(column_name)
+                                           FROM (DESCRIBE SELECT * FROM sales)));
+```
+
+You can use the same pattern with arbitrary expressions (CTEs, joins, computed
+columns, aliases). Just make sure the inner query inside `COPY` and the query
+inside `DESCRIBE` produce the **same columns in the same order**:
+
+```sql
+WITH enriched AS (
+    SELECT
+        s.id,
+        s.amount,
+        c.category,
+        s.sale_date,
+        s.amount * 0.2 AS vat_amount
+    FROM sales s
+    JOIN categories c ON c.id = s.category_id
+)
+COPY (SELECT * FROM enriched)
+  TO 'enriched_sales.qvd' (
+    FORMAT qvd,
+    FIELD_NAMES (SELECT list(column_name) FROM (DESCRIBE SELECT * FROM enriched))
+  );
+```
+
+The number of names must exactly match the number of output columns, otherwise
+the statement errors out.
+
+### Precision of `DECIMAL` and `INTERVAL`
+
+- `DECIMAL` is written as `DOUBLE` because the QVD format does not store a
+  fixed-point decimal type. Values are converted with full `f64` precision, but
+  the round-trip is `DECIMAL` → `DOUBLE`. If exact decimal precision is
+  required, cast explicitly before writing or choose another format.
+
+- `INTERVAL` with a **month** component is approximated as **30 days per month**
+  when writing to QVD, because the Qlik serial format has no month notion. For
+  example, `INTERVAL '1 month'` is stored as 30 days and reads back as such.
+  Month-bearing intervals are therefore not perfectly round-trippable.
+
 ## Performance (reading)
 
 Measured on `flights.QVD` (**439 MB, 10 million rows, 49 columns**),
