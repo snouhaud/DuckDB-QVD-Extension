@@ -13,7 +13,7 @@ COPY sales FROM 'output.qvd' (FORMAT qvd);
 
 ## Project status
 
-**Reading is functional, verified in live DuckDB (v1.5.3).** The extension
+**Reading is functional, verified in live DuckDB (v1.5.5).** The extension
 registers itself, declares the `read_qvd(VARCHAR)` table function, and reads QVD
 files in **streaming projected** mode via `qvdrs`' low-level primitives: a DuckDB
 type is inferred per field from the header alone (at `bind`), then — for the
@@ -259,7 +259,7 @@ make cargo-build        # or: cargo build
 
 This project uses the official DuckDB **community build template** from
 [`extension-ci-tools`](https://github.com/duckdb/extension-ci-tools), vendored as
-a **git submodule pinned to the `v1.5.3` branch** (matching `TARGET_DUCKDB_VERSION`)
+a **git submodule pinned to the `v1.5.5` branch** (matching `TARGET_DUCKDB_VERSION`)
 — the same flow the community-extensions infrastructure runs. Clone with
 `git clone --recurse-submodules …`, or initialise the submodule after the fact:
 
@@ -273,7 +273,7 @@ make debug              # → build/debug/qvd.duckdb_extension
 `make debug` compiles the library and appends the metadata footer via
 `append_extension_metadata.py`. For the C_STRUCT_UNSTABLE ABI, DuckDB requires
 the stamped version to match the host exactly: `TARGET_DUCKDB_VERSION` is
-**v1.5.3** (the current community version).
+**v1.5.5** (the current community version).
 
 Loading (unsigned extension):
 
@@ -290,7 +290,7 @@ duckdb -unsigned -c "LOAD 'build/debug/qvd.duckdb_extension'; \
 
 ```sh
 make test                   # SQLLogicTest suite against the built extension
-cargo +1.95.0 test --lib    # Rust unit test: generates a QVD then reads it back
+cargo +1.97.1 test --lib    # Rust unit test: generates a QVD then reads it back
 ```
 
 `make test` runs the `test/sql/*.test` files through the community SQLLogicTest
