@@ -227,25 +227,66 @@ impl QvdScan {
             .map(|nm| header.fields.iter().position(|f| &f.field_name == nm))
             .collect();
 
-        // Section symboles = [binary_start .. binary_start + header.offset] ; on ne
-        // décode (read_symbols) QUE les colonnes projetées → dictionnaire de Cell.
-        let mut sym_section = vec![0u8; header.offset];
-        file.seek(SeekFrom::Start(binary_start))?;
-        file.read_exact(&mut sym_section)?;
-        let dicts: Vec<Vec<Cell>> = positions
+        // Section symboles = [binary_start .. binary_start + header.offset]. Deux
+        // stratégies : si la projection couvre l'essentiel de la section, une seule
+        // lecture séquentielle bat N seeks (mêmes octets, moins de syscalls) ; sinon
+        // on ne lit QUE la plage d'octets de chaque colonne projetée. Sur un QVD
+        // large, les tables de symboles non projetées peuvent représenter
+        // l'essentiel du fichier, et les lire coûte de l'I/O et de la mémoire pour
+        // rien. La projection était déjà appliquée au *décodage* ; elle l'est
+        // désormais aussi à la *lecture*.
+        //
+        // EN: symbol section = [binary_start .. binary_start + header.offset]. Two
+        // strategies: when the projection covers most of the section, a single
+        // sequential read beats N seeks (same bytes, fewer syscalls); otherwise we
+        // read ONLY each projected field's byte range. On a wide QVD the
+        // non-projected symbol tables can account for most of the file, so reading
+        // them wastes I/O and memory. Projection already applied at *decode* time;
+        // now also at *read* time.
+        let needed_bytes: usize = positions
             .iter()
-            .enumerate()
-            .map(|(j, p)| match p {
-                Some(fi) => qvdrs::symbol::read_symbols(&sym_section, &header.fields[*fi])
-                    .map(|syms| {
-                        syms.iter()
-                            .map(|s| convert(self.needed_kinds[j], &QvdValue::Symbol(s.clone())))
+            .filter_map(|p| p.map(|fi| header.fields[fi].length))
+            .sum();
+        let bulk = needed_bytes.saturating_mul(4) >= header.offset.saturating_mul(3);
+        let sym_section = if bulk {
+            let mut buf = vec![0u8; header.offset];
+            file.seek(SeekFrom::Start(binary_start))?;
+            file.read_exact(&mut buf)?;
+            Some(buf)
+        } else {
+            None
+        };
+
+        let mut dicts: Vec<Vec<Cell>> = Vec::with_capacity(positions.len());
+        for (j, p) in positions.iter().enumerate() {
+            let cells = match p {
+                Some(fi) => {
+                    let f = &header.fields[*fi];
+                    let syms = if let Some(sec) = &sym_section {
+                        qvdrs::symbol::read_symbols(sec, f)
+                    } else {
+                        let mut sym_buf = vec![0u8; f.length];
+                        file.seek(SeekFrom::Start(binary_start + f.offset as u64))?;
+                        file.read_exact(&mut sym_buf)?;
+                        // `read_symbols` tranche `buf[offset .. offset + length]` ;
+                        // ici le buffer commence au champ, donc offset local = 0.
+                        // EN: `read_symbols` slices `buf[offset .. offset + length]`;
+                        // this buffer starts at the field, so local offset is 0.
+                        let mut local = f.clone();
+                        local.offset = 0;
+                        qvdrs::symbol::read_symbols(&sym_buf, &local)
+                    };
+                    syms.map(|v| {
+                        v.iter()
+                            .map(|x| convert(self.needed_kinds[j], &QvdValue::Symbol(x.clone())))
                             .collect()
                     })
-                    .unwrap_or_default(),
+                    .unwrap_or_default()
+                }
                 None => Vec::new(),
-            })
-            .collect();
+            };
+            dicts.push(cells);
+        }
 
         st.fields = positions.iter().map(|p| p.map(|fi| header.fields[fi].clone())).collect();
         st.dicts = dicts;
