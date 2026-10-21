@@ -15,6 +15,10 @@ USE_UNSTABLE_C_API=1
 DUCKDB_RS_ENC := $(shell sed -n 's/^duckdb = .*version = "=1\.\([0-9]\{5\}\)\.[0-9]*".*/\1/p' Cargo.toml)
 TARGET_DUCKDB_VERSION := v$(shell v=$(DUCKDB_RS_ENC); echo "$$((v/10000)).$$((v/100%100)).$$((v%100))")
 
+# Test against that same DuckDB: ci-tools otherwise pip-installs the latest
+# release, which the version-pinned binary refuses to load.
+DUCKDB_TEST_VERSION := $(patsubst v%,%,$(TARGET_DUCKDB_VERSION))
+
 all: configure debug
 
 # Initialise the extension-ci-tools submodule (the community build template).
