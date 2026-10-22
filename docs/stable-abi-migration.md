@@ -1,61 +1,44 @@
 # Stable C ABI migration — notes
 
-**Status: not pursued (2026-07). Staying on the unstable C ABI.** This file records
-why, and what would have to change for the migration to become worthwhile.
+**Status: done in v1.0.5 (2026-10). The extension is built on the stable C ABI
+(`C_STRUCT`), V1 C API pinned at `v1.5.6`.**
 
-## The problem it would solve
+## Why it happened
 
-The extension is built with `--abi-type C_STRUCT_UNSTABLE` (DuckDB's *unstable* C
-extension ABI). A binary therefore loads on **exactly one** DuckDB version — every
-DuckDB release requires a rebuild (bump the `duckdb` crate, move the
-`extension-ci-tools` submodule branch, `make release`).
+DuckDB 2.0.0 reserves the unstable ABI (`C_STRUCT_UNSTABLE`) for the new **V2 C
+API**: an unstable binary must export `<name>_init_c_api_v2`. A V1 extension —
+which is what the `duckdb` crate builds (`<name>_init_c_api`) — is only accepted
+on the stable ABI, with a V1 API version of at most `v1.5.6`. Staying on the
+unstable ABI was therefore no longer possible.
 
-DuckDB's *stable* C ABI (`C_STRUCT`) is forward-compatible: build once, load on
-multiple DuckDB versions. Moving to it is the only way to drop the per-version
-rebuild — **not** dropping the C API itself (impossible for a Rust extension: the
-C API is the only interface Rust has to DuckDB; the C++ internal API is not
-callable from Rust).
+## Why it was possible
 
-## Why we don't do it today — two blockers
+The two blockers recorded here in 2026-07 both went away with DuckDB 1.5.6:
 
-1. **`duckdb-rs` is unstable-only.** The whole safe layer we rely on (`read_qvd`'s
-   `VTab`, the C-API entrypoint, Arrow/vector conversion) is built on the unstable
-   API struct. There is no stable-ABI mode in the crate. Going stable means
-   dropping duckdb-rs's extension layer and hand-rolling raw FFI against the frozen
-   subset of `duckdb.h` — a substantial rewrite of `src/lib.rs` and part of
-   `src/qvd.rs`.
+1. **Copy functions outside the frozen set** — DuckDB 1.5.6 regenerated the C API
+   from a spec (duckdb/duckdb#24131) and moved every post-`v1.2.0` function,
+   copy functions included, into a stable `AT_LEAST(1, 5, 6)` band. The unstable
+   tail of the V1 struct is empty. All functions we call are in the stable set.
+2. **`duckdb-rs` is unstable-only** — its bindgen still passes
+   `-DDUCKDB_EXTENSION_API_VERSION_UNSTABLE`, but with an empty unstable tail the
+   generated struct is exactly the stable one. The requested API version comes
+   from `DUCKDB_EXTENSION_MIN_DUCKDB_VERSION` (`src/lib.rs`), set by the Makefile.
 
-2. **The COPY function API is outside the frozen set.** The stable baseline is
-   frozen at `v1.2.0` (`DUCKDB_EXTENSION_API_VERSION_STRING "v1.2.0"` in
-   `extension_api.hpp`). The copy functions (`duckdb_create_copy_function`,
-   `duckdb_register_copy_function`, `…_set_copy_from_function`, …) sit in the
-   post-freeze region of the `duckdb_ext_api_v1` struct. So `COPY … TO/FROM
-   (FORMAT qvd)` (all of `src/copy.rs` + `src/copy_from.rs`) **cannot** be built on
-   the stable ABI until DuckDB promotes copy functions into the frozen set — which
-   is upstream's decision, not ours. (The read path may also touch post-1.2.0
-   functions, e.g. table-function projection pushdown — verify before assuming the
-   reader alone can go stable.)
+No source change was needed: only `USE_UNSTABLE_C_API=0` and
+`TARGET_DUCKDB_VERSION := v1.5.6` in the `Makefile`.
 
-## When to revisit
+## What it buys
 
-Reconsider if **all** of these hold:
+One binary loads on every DuckDB providing the V1 C API `v1.5.6`: verified on
+**1.5.6 and 2.0.0** with the same build (`duckdb` crate `1.20000.0`). A DuckDB
+release no longer forces a rebuild; bumping the crate is now optional (tests run
+against the DuckDB version the crate encodes, via `DUCKDB_TEST_VERSION`).
 
-- Forward compatibility becomes a hard requirement (e.g. distributing a single
-  binary across DuckDB versions, or the per-release rebump becomes a real burden).
-- DuckDB promotes the copy-function C API into the stable frozen set — check
-  `extension_api.hpp` / release notes. **Blocker #2 is the gate; without it even a
-  partial migration can't cover writing.**
-- Either `duckdb-rs` gains stable-ABI support, or we accept a raw-FFI rewrite.
+## What to watch
 
-## If revisited, the only sensible shape
-
-Split the extension: a **read-only `read_qvd`** built as raw FFI on the stable ABI
-(forward-compatible reads), with the **write path staying on the unstable ABI**.
-This doubles maintenance, so only do it on real need — not speculatively.
-
-## Cost comparison (why staying put wins for now)
-
-- Per-version rebump (current): bump `duckdb` crate + submodule branch +
-  `make release`, ~2 min, **zero source changes**.
-- Stable-ABI migration: weeks of work, partly **blocked upstream**, and only pays
-  off once forward-compat is actually needed.
+- **Never call a function outside the stable V1 set.** If a later `duckdb` crate
+  grows an unstable tail again, its symbols compile fine but are not guaranteed
+  at load time.
+- **The V2 C API** (`duckdb-neo` crate) brings COPY column names, filter
+  pushdown, progress, etc., but is unstable (tied to one DuckDB version) as of
+  2.0.0. Revisit once it has a stable surface.

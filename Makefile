@@ -3,21 +3,20 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 EXTENSION_NAME=qvd
 
-# Set to 1 to enable the unstable C API (binaries only work on TARGET_DUCKDB_VERSION,
-# forward compatibility is broken). Required: duckdb-rs relies on the unstable C API.
-USE_UNSTABLE_C_API=1
+# Stable C ABI (C_STRUCT): since DuckDB 2.0 the unstable ABI is reserved to the
+# V2 C API, so a V1 extension (duckdb-rs `duckdb` crate) must be stable. The
+# binary then loads on every DuckDB whose V1 C API is >= TARGET_DUCKDB_VERSION.
+USE_UNSTABLE_C_API=0
 
-# Target DuckDB version, derived from the pinned `duckdb` crate in Cargo.toml.
-# That crate is the single source of truth: its version encodes the DuckDB
-# version of the unstable C ABI (e.g. 1.10504.0 -> v1.5.4), and the binary only
-# loads on that exact version. Bumping the crate in Cargo.toml propagates here,
-# so the two can never drift. Falls back to v0.0.1 (ci-tools default) if unset.
+# Minimum V1 C API version requested at load (stamped in the footer). The V1 API
+# is frozen at v1.5.6, which holds every function we call (copy functions included).
+TARGET_DUCKDB_VERSION := v1.5.6
+
+# Test against the DuckDB the pinned `duckdb` crate in Cargo.toml was built for:
+# its version encodes it (e.g. 1.20000.0 -> 2.0.0). Without this, ci-tools
+# pip-installs the latest DuckDB release.
 DUCKDB_RS_ENC := $(shell sed -n 's/^duckdb = .*version = "=1\.\([0-9]\{5\}\)\.[0-9]*".*/\1/p' Cargo.toml)
-TARGET_DUCKDB_VERSION := v$(shell v=$(DUCKDB_RS_ENC); echo "$$((v/10000)).$$((v/100%100)).$$((v%100))")
-
-# Test against that same DuckDB: ci-tools otherwise pip-installs the latest
-# release, which the version-pinned binary refuses to load.
-DUCKDB_TEST_VERSION := $(patsubst v%,%,$(TARGET_DUCKDB_VERSION))
+DUCKDB_TEST_VERSION := $(shell v=$(DUCKDB_RS_ENC); echo "$$((v/10000)).$$((v/100%100)).$$((v%100))")
 
 all: configure debug
 
