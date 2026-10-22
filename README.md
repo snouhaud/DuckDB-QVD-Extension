@@ -13,7 +13,7 @@ COPY sales FROM 'output.qvd' (FORMAT qvd);
 
 ## Project status
 
-**Reading is functional, verified in live DuckDB (v1.5.6).** The extension
+**Reading is functional, verified in live DuckDB (v2.0.0).** The extension
 registers itself, declares the `read_qvd(VARCHAR)` table function, and reads QVD
 files in **streaming projected** mode via `qvdrs`' low-level primitives: a DuckDB
 type is inferred per field from the header alone (at `bind`), then — for the
@@ -259,7 +259,7 @@ make cargo-build        # or: cargo build
 
 This project uses the official DuckDB **community build template** from
 [`extension-ci-tools`](https://github.com/duckdb/extension-ci-tools), vendored as
-a **git submodule pinned to the `v1.5.6` branch** (matching `TARGET_DUCKDB_VERSION`)
+a **git submodule pinned to the `v2.0-cyanoptera` branch** (matching the DuckDB version of the `duckdb` crate)
 — the same flow the community-extensions infrastructure runs. Clone with
 `git clone --recurse-submodules …`, or initialise the submodule after the fact:
 
@@ -271,9 +271,10 @@ make debug              # → build/debug/qvd.duckdb_extension
 ```
 
 `make debug` compiles the library and appends the metadata footer via
-`append_extension_metadata.py`. For the C_STRUCT_UNSTABLE ABI, DuckDB requires
-the stamped version to match the host exactly: `TARGET_DUCKDB_VERSION` is
-**v1.5.6** (the current community version).
+`append_extension_metadata.py`. The extension uses the **stable C ABI**
+(`C_STRUCT`): the stamped `TARGET_DUCKDB_VERSION` is the minimum V1 C API
+version, **v1.5.6**, so one binary loads on DuckDB 1.5.6 and 2.0.x (see
+[`docs/stable-abi-migration.md`](docs/stable-abi-migration.md)).
 
 Loading (unsigned extension):
 
