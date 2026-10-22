@@ -17,7 +17,7 @@ strip = true
 # crate-type ne peut pas (pour l'instant) être surchargé par cible.
 # src/wasm_lib.rs réexporte src/lib.rs pour passer de cdylib (compilation
 # native) à staticlib (nécessaire pour le linkage final via emcc en Wasm).
-name = "qvd"
+name = "qvd_next"
 path = "src/wasm_lib.rs"
 crate-type = ["staticlib"]
 

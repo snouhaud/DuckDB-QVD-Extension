@@ -85,7 +85,7 @@ pub(crate) enum Kind {
 }
 
 /// Valeur convertie, prête à écrire dans un vecteur DuckDB. Mutualise la logique
-/// de conversion entre `lib.rs` (FlatVector) et `copy_from.rs` (FFI brut).
+/// d'écriture (`write_cells`) entre `read_qvd` et `COPY ... FROM`.
 #[derive(Clone)]
 pub(crate) enum Cell {
     I64(i64),

@@ -1,5 +1,9 @@
 # Stable C ABI migration — notes
 
+> This note concerns the **`qvd`** extension (branch `main`). `qvd_next` (this
+> branch) deliberately uses the C API v2 on the unstable ABI, pinned to DuckDB
+> 2.0.0: see the README.
+
 **Status: done in v1.0.5 (2026-10). The extension is built on the stable C ABI
 (`C_STRUCT`), V1 C API pinned at `v1.5.6`.**
 

@@ -12,6 +12,8 @@
 > ABI, one binary for DuckDB 1.5.6 and 2.0.x) stays the conservative choice.
 > **Load only one of them per session**: both register `read_qvd` and `FORMAT qvd`.
 >
+> Once published to the community repository (not yet):
+>
 > ```sql
 > INSTALL qvd_next FROM community;
 > LOAD qvd_next;
@@ -39,7 +41,7 @@ are decoded and each symbol is converted to a typed value once. The bit-packed
 index block is read **in chunks of 2048 rows** and, for each record, only the
 **projected fields' bits** are extracted (`read_field_index`); rows are emitted by
 index lookup, one file open at a time. Memory is **bounded** (≈ projected symbol
-tables + one chunk of index bytes), regardless of the number of rows — no
+tables + one ~8 MiB block of index bytes, read ahead), regardless of the number of rows — no
 materializing, no per-row reconversion, and **work scales with the number of
 projected columns, not the total**.
 The `DATE`/`BIGINT`/`VARCHAR` columns behave like real SQL types (filters,
@@ -176,7 +178,7 @@ target column types when they differ from the types `read_qvd` infers.
 - Typing driven by Qlik tags; a QVD without tags falls back to `<Type>` and then
   `VARCHAR` by default (files produced by Qlik are always tagged).
 - **Streaming projected read with bounded memory** (≈ projected symbol tables +
-  one chunk of index bytes). Only the **projected** columns' symbol tables are read
+  one ~8 MiB block of index bytes). Only the **projected** columns' symbol tables are read
   and decoded, and only the projected fields' bits are extracted per record — work
   scales with the projection, not the total column count. The index block's
   **bytes** are still read in full (fields are bit-interleaved in each record — a
@@ -248,15 +250,15 @@ further cuts I/O and memory on wide files.
 
 | File                           | Role                                                                                            |
 | ------------------------------ | ----------------------------------------------------------------------------------------------- |
-| `src/lib.rs`                   | C-API entrypoint + `read_qvd` VTab (DuckDB plumbing, streaming)                                 |
+| `src/lib.rs`                   | C API v2 entrypoint + `read_qvd` table function, VFS adapter, DuckDB glob                       |
 | `src/qvd.rs`                   | QVD format: header validation/typing, projected symbol + index decode, conversions + unit tests |
-| `src/copy.rs`                  | `COPY ... TO (FORMAT qvd)`: copy function (raw FFI), OpenQVD writer                             |
-| `src/copy_from.rs`             | `COPY ... FROM (FORMAT qvd)`: copy-from table function (raw FFI)                                |
+| `src/copy.rs`                  | `COPY ... TO (FORMAT qvd)`: copy function (C API v2), OpenQVD writer                            |
+| `src/copy_from.rs`             | `COPY ... FROM (FORMAT qvd)`: copy-from side, casts to the target types                         |
 | `src/wasm_lib.rs`              | Re-export for the Wasm target (staticlib)                                                       |
-| `Cargo.toml`                   | Dependencies (`duckdb`, `qvd`/qvdrs, `openqvd`, `glob`)                                         |
+| `Cargo.toml`                   | Dependencies (`duckdb-neo`, `duckdb-loadable-macros`, `qvd`/qvdrs, `openqvd`)                   |
 | `Makefile`                     | C-API build (`make debug`/`release`) + fast cargo targets                                       |
 | `test/sql/*.test`              | SQLLogicTest suites (`read_qvd`, `COPY TO/FROM`)                                                |
-| `docs/stable-abi-migration.md` | Why the extension uses the stable C ABI                                                         |
+| `docs/stable-abi-migration.md` | Why `qvd` (not `qvd_next`) uses the stable C ABI                                                |
 | `scripts/build-extension.sh`   | Standalone build without the Makefile/venv                                                      |
 
 ## Build
@@ -271,33 +273,33 @@ make cargo-build        # or: cargo build
 
 This project uses the official DuckDB **community build template** from
 [`extension-ci-tools`](https://github.com/duckdb/extension-ci-tools), vendored as
-a **git submodule pinned to the `v2.0-cyanoptera` branch** (matching the DuckDB version of the `duckdb` crate)
+a **git submodule pinned to the `v2.0-cyanoptera` branch** (matching `TARGET_DUCKDB_VERSION`, v2.0.0)
 — the same flow the community-extensions infrastructure runs. Clone with
 `git clone --recurse-submodules …`, or initialise the submodule after the fact:
 
 ```sh
 make bootstrap          # git submodule update --init --recursive (once)
 make configure          # creates a Python venv (duckdb + sqllogictest runner)
-make debug              # → build/debug/qvd.duckdb_extension
-# make release          # → build/release/qvd.duckdb_extension
+make debug              # → build/debug/qvd_next.duckdb_extension
+# make release          # → build/release/qvd_next.duckdb_extension
 ```
 
 `make debug` compiles the library and appends the metadata footer via
-`append_extension_metadata.py`. The extension uses the **stable C ABI**
-(`C_STRUCT`): the stamped `TARGET_DUCKDB_VERSION` is the minimum V1 C API
-version, **v1.5.6**, so one binary loads on DuckDB 1.5.6 and 2.0.x (see
-[`docs/stable-abi-migration.md`](docs/stable-abi-migration.md)).
+`append_extension_metadata.py`. `qvd_next` uses DuckDB's **C API v2**, which has
+no stable surface yet: the footer is `C_STRUCT_UNSTABLE`, stamped with
+`TARGET_DUCKDB_VERSION` (**v2.0.0**), and the binary only loads on that exact
+DuckDB version. Each DuckDB release needs a `duckdb-neo` bump and a rebuild.
 
 Loading (unsigned extension):
 
 ```sh
-duckdb -unsigned -c "LOAD 'build/debug/qvd.duckdb_extension'; \
+duckdb -unsigned -c "LOAD 'build/debug/qvd_next.duckdb_extension'; \
   SELECT * FROM read_qvd('QVD-Examples/Ventes.qvd');"
 ```
 
 > A standalone script `./scripts/build-extension.sh` also produces a
-> `build/qvd.duckdb_extension` (debug, stable ABI, V1 C API v1.5.6) without the
-> Makefile/venv, handy for quick local checks.
+> `build/qvd_next.duckdb_extension` (debug, unstable ABI, DuckDB v2.0.0) without
+> the Makefile/venv, handy for quick local checks.
 
 ## Tests
 
@@ -321,11 +323,13 @@ To test on real QVDs: drop files into `test/data/` and adapt
 - [x] Native temporal types `DATE`/`TIMESTAMP`/`TIME`/`INTERVAL` (Qlik serials converted).
 - [x] Projection pushdown (only the projected columns' symbols and bits are read).
 - [x] Glob `read_qvd('data/*.qvd')` (concatenated rows, resolution by name).
-- [x] Writing `COPY ... TO ... (FORMAT qvd)` (FFI copy function; round-trip verified).
+- [x] Writing `COPY ... TO ... (FORMAT qvd)` (C API v2 copy function; round-trip verified).
 - [x] Preserve column names on write (query names, `FIELD_NAMES` override).
 - [x] Writing `DECIMAL`s (all widths i16/i32/i64/i128 → DOUBLE).
 - [x] Writing `TIME`/`INTERVAL` (full temporal round-trip verified).
-- [x] Import `COPY table FROM 'x.qvd'` (FFI table function; round-trip verified).
+- [x] Import `COPY table FROM 'x.qvd'` (casts to the target types; round-trip verified).
+- [x] Remote files and globs through DuckDB's file system (S3 verified on RustFS).
+- [x] `read_qvd` documented in `duckdb_functions()`.
 
 ## License
 

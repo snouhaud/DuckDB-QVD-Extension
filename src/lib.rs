@@ -1,4 +1,4 @@
-//! Extension DuckDB `qvd` — expose la table function `read_qvd('fichier.qvd')`.
+//! Extension DuckDB `qvd_next` — expose la table function `read_qvd('fichier.qvd')`.
 //!
 //! `lib.rs` porte la plomberie DuckDB (C API v2 via `duckdb-neo` : point
 //! d'entrée, table function). La lecture (streaming) et le typage du format QVD
