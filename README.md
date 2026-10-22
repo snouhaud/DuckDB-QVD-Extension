@@ -107,8 +107,14 @@ COPY sales FROM 's3://bucket/out/sales.qvd' (FORMAT qvd);
 
 Remote reads use ranged requests and DuckDB's external file cache: only the
 projected columns' symbol tables are fetched (plus the record index block, which
-interleaves all fields). Verified against an S3-compatible store (RustFS): on a
-399 MB file, `sum(k)` over one column transferred 51 MB, all columns 399 MB.
+interleaves all fields, read in ~8 MiB blocks to amortize request latency).
+Verified against an S3-compatible store (RustFS), on a 399 MB / 3M-row file:
+
+| Query                 | Transferred | GET requests | Time    |
+| --------------------- | ----------: | -----------: | ------: |
+| `sum(k)` (one column) | 51 MB       | 29           | 0.10 s  |
+| `count(DISTINCT h1)`  | 153 MB      | 77           | 0.75 s  |
+| all columns           | 399 MB      | 194          | 2.0 s   |
 
 ### Writing: `COPY ... TO ... (FORMAT qvd)`
 
@@ -168,8 +174,6 @@ target column types when they differ from the types `read_qvd` infers.
   read in full (fields are bit-interleaved in each record — a QVD format trait), but
   warm that is cheap; the former bottleneck was extracting all columns' bits.
 - **Writing** (`COPY TO`) still accumulates all rows in memory (OpenQVD writer).
-- Remote reads issue one ranged request per 2048-row index chunk (latency-bound
-  on high-latency storage).
 
 ## Important limitations and behaviour notes
 

@@ -47,6 +47,10 @@ pub(crate) type Open<'a> = &'a dyn Fn(&str) -> std::io::Result<Box<dyn Source>>;
 /// Nombre max de lignes décodées par chunk.
 const VECTOR_SIZE: usize = 2048;
 
+/// Taille visée d'une lecture du bloc d'index (plusieurs chunks à la fois) : en
+/// distant, chaque lecture est une requête HTTP ; 8 Mio en amortissent la latence.
+const INDEX_READ_BYTES: usize = 8 << 20;
+
 /// Représentation physique d'un `INTERVAL` DuckDB (`duckdb_interval`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -139,6 +143,9 @@ struct ScanState {
     record_bytes: usize,
     index_off: u64,    // offset absolu du bloc d'index dans le fichier
     row: usize,        // curseur de ligne dans le fichier courant
+    /// Octets d'index lus d'avance (records entiers) et première ligne couverte.
+    idx_buf: Vec<u8>,
+    idx_buf_row: usize,
 }
 
 /// Un paquet de lignes tiré du scan.
@@ -196,6 +203,8 @@ impl QvdScan {
                 record_bytes: 0,
                 index_off: 0,
                 row: 0,
+                idx_buf: Vec::new(),
+                idx_buf_row: 0,
             }),
         })
     }
@@ -293,6 +302,8 @@ impl QvdScan {
         st.record_bytes = header.record_byte_size;
         st.index_off = binary_start + header.offset as u64;
         st.row = 0;
+        st.idx_buf.clear();
+        st.idx_buf_row = 0;
         st.file = Some(file);
         Ok(())
     }
@@ -329,15 +340,24 @@ impl QvdScan {
 
             let rbs = st.record_bytes;
             let n = (st.file_rows - st.row).min(VECTOR_SIZE);
-            let off = st.index_off + (st.row as u64) * rbs as u64;
 
-            // Lire le bloc d'octets du chunk (records entiers, champs entrelacés bit-packés).
-            let mut buf = vec![0u8; n * rbs];
-            {
+            // Octets d'index du chunk (records entiers, champs entrelacés bit-packés),
+            // lus d'avance par blocs d'environ INDEX_READ_BYTES quand le tampon ne
+            // couvre plus le chunk.
+            let buffered_rows = if rbs == 0 { usize::MAX } else { st.idx_buf.len() / rbs };
+            if st.row + n > st.idx_buf_row.saturating_add(buffered_rows) {
+                let rows = (st.file_rows - st.row).min((INDEX_READ_BYTES / rbs.max(1)).max(n));
+                let off = st.index_off + (st.row as u64) * rbs as u64;
+                let mut block = std::mem::take(&mut st.idx_buf);
+                block.resize(rows * rbs, 0);
                 let f = st.file.as_mut().unwrap();
                 f.seek(SeekFrom::Start(off))?;
-                f.read_exact(&mut buf)?;
+                f.read_exact(&mut block)?;
+                st.idx_buf = block;
+                st.idx_buf_row = st.row;
             }
+            let start = (st.row - st.idx_buf_row) * rbs;
+            let buf = &st.idx_buf[start..start + n * rbs];
 
             // N'extraire (read_field_index) QUE les champs projetés → Cell par lookup.
             let columns: Vec<Vec<Cell>> = (0..self.needed_kinds.len())
