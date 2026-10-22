@@ -8,19 +8,19 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TOOLCHAIN="${RUST_TOOLCHAIN:-1.95.0}"
+TOOLCHAIN="${RUST_TOOLCHAIN:-1.97.1}"
 EXT_NAME="qvd"
-EXT_VERSION="1.0.2"
+EXT_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
 
 # 1. Compiler la bibliothèque native.
 ( cd "$ROOT" && DUCKDB_EXTENSION_MIN_DUCKDB_VERSION=v1.5.6 cargo "+$TOOLCHAIN" build )
 
 # 2. Plateforme DuckDB.
 case "$(uname -s)-$(uname -m)" in
-  Darwin-arm64)  PLATFORM=osx_arm64 ;;
-  Darwin-x86_64) PLATFORM=osx_amd64 ;;
-  Linux-x86_64)  PLATFORM=linux_amd64 ;;
-  Linux-aarch64) PLATFORM=linux_arm64 ;;
+  Darwin-arm64)  PLATFORM=osx_arm64;   LIB_EXT=dylib ;;
+  Darwin-x86_64) PLATFORM=osx_amd64;   LIB_EXT=dylib ;;
+  Linux-x86_64)  PLATFORM=linux_amd64; LIB_EXT=so ;;
+  Linux-aarch64) PLATFORM=linux_arm64; LIB_EXT=so ;;
   *) echo "Plateforme non gérée : $(uname -s)-$(uname -m)" >&2; exit 1 ;;
 esac
 
@@ -31,7 +31,7 @@ echo "Plateforme=$PLATFORM  DuckDB=$DUCKDB_VERSION"
 # 4. Apposer le footer de métadonnées.
 mkdir -p "$ROOT/build"
 python3 "$ROOT/extension-ci-tools/scripts/append_extension_metadata.py" \
-  -l "$ROOT/target/debug/lib${EXT_NAME}.dylib" \
+  -l "$ROOT/target/debug/lib${EXT_NAME}.${LIB_EXT}" \
   -o "$ROOT/build/${EXT_NAME}.duckdb_extension" \
   -n "$EXT_NAME" \
   -dv "$DUCKDB_VERSION" \
