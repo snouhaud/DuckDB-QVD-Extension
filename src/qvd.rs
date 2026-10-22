@@ -265,6 +265,15 @@ impl QvdScan {
                     let syms = if let Some(sec) = &sym_section {
                         qvdrs::symbol::read_symbols(sec, f)
                     } else {
+                        // Plage lue directement dans le fichier : la borner à la
+                        // section des symboles (en-tête non fiable) avant d'allouer.
+                        if f.offset.checked_add(f.length).is_none_or(|end| end > header.offset) {
+                            return Err(format!(
+                                "table de symboles de '{}' hors de la section des symboles",
+                                f.field_name
+                            )
+                            .into());
+                        }
                         let mut sym_buf = vec![0u8; f.length];
                         file.seek(SeekFrom::Start(binary_start + f.offset as u64))?;
                         file.read_exact(&mut sym_buf)?;
@@ -749,6 +758,36 @@ mod tests {
         ];
         let bytes = WriteTable::new("ti", cols).unwrap().to_bytes().unwrap();
         std::fs::write("/tmp/ti_sample.qvd", bytes).unwrap();
+    }
+
+    /// Lecture par champ (projection étroite) : une table de symboles déclarée
+    /// hors de la section des symboles est une erreur, pas des octets de l'index
+    /// lus comme symboles.
+    #[test]
+    fn symbol_table_outside_section_is_an_error() {
+        let big: Vec<Option<Value>> = (0..1000).map(|i| Some(Value::Str(format!("val{i:04}")))).collect();
+        let small: Vec<Option<Value>> = (0..1000).map(|i| Some(Value::Int(i % 2))).collect();
+        let path = write_temp("qvdrs_bounds_test.qvd", vec![tagged("a", big, &["$text"]), tagged("b", small, &["$integer"])]);
+
+        // Déplace l'Offset du champ `b` à la fin de la section des symboles.
+        let (_f, header, _bs) = read_header(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let field_b = find(&bytes, b"<FieldName>b</FieldName>");
+        let start = field_b + find(&bytes[field_b..], b"<Offset>") + b"<Offset>".len();
+        let end = start + find(&bytes[start..], b"<");
+        bytes.splice(start..end, header.offset.to_string().into_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let s = read_schema(&path).unwrap();
+        let res = QvdScan::new(std::slice::from_ref(&path), &s.names, &s.kinds, &[1]).and_then(|scan| {
+            while !matches!(scan.pull()?, Pull::Done) {}
+            Ok(())
+        });
+        assert!(res.unwrap_err().to_string().contains("hors de la section"));
+    }
+
+    fn find(hay: &[u8], needle: &[u8]) -> usize {
+        hay.windows(needle.len()).position(|w| w == needle).unwrap()
     }
 
     /// Diagnostic sur les vrais fichiers de `QVD-Examples/` (non lancé par défaut).
