@@ -56,21 +56,16 @@ SELECT * FROM t ORDER BY i NULLS LAST;
 1	1.5	a	2024-01-02	2024-01-02 03:04:05	12:30:00	2 days	3000000000	12.34	1
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
 
-# COPY FROM into a column whose type differs from the QVD field: explicit error
-# (the V1 C API cannot cast; INSERT ... SELECT FROM read_qvd lets DuckDB cast).
+# COPY FROM into columns whose types differ from the QVD fields: values are
+# cast to the target types.
 statement ok
-CREATE TABLE mismatch (i DOUBLE);
+CREATE TABLE mismatch (i DOUBLE, d VARCHAR);
 
-statement error
+statement ok
 COPY mismatch FROM '__WORKING_DIRECTORY__/build/all_types.qvd' (FORMAT qvd);
-----
-read_qvd
 
-statement ok
-INSERT INTO mismatch SELECT i FROM read_qvd('__WORKING_DIRECTORY__/build/all_types.qvd');
-
-query R
+query RT
 SELECT * FROM mismatch ORDER BY i NULLS LAST;
 ----
-1.0
-NULL
+1.0	1.5
+NULL	NULL

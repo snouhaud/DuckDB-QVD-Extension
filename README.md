@@ -118,10 +118,8 @@ in [`src/copy_from.rs`](src/copy_from.rs) and reuses the reading/typing of
 `read_qvd`. All types (including `DATE`/`TIME`/`INTERVAL`) and `NULL`s are
 restored; round-trip `COPY TO` → `COPY FROM` verified.
 
-QVD fields map to the table's columns **by position**, and each column must have
-the type `read_qvd` infers for its field (the C API cannot convert values here):
-a mismatch is a bind error. To convert, use
-`INSERT INTO sales SELECT * FROM read_qvd('sales.qvd')`, where DuckDB casts.
+QVD fields map to the table's columns **by position**; values are cast to the
+target column types when they differ from the types `read_qvd` infers.
 
 ### Known limitations (future improvements)
 
