@@ -26,7 +26,7 @@ unsafe extern "C" fn destroy_init(data: *mut c_void) {
     drop(Box::from_raw(data as *mut QvdScan));
 }
 
-/// `bind` : lit le chemin (1er paramètre), déclare les colonnes du QVD.
+/// `bind` : lit le chemin (1er paramètre) et vérifie le schéma de la table cible.
 unsafe extern "C" fn cf_bind(info: ffi::duckdb_bind_info) {
     match bind_inner(info) {
         Ok(bind) => {
@@ -52,13 +52,35 @@ unsafe fn bind_inner(info: ffi::duckdb_bind_info) -> Result<CfBind, String> {
     };
     ffi::duckdb_destroy_value(&mut pval);
 
-    let Schema { names, kinds, type_ids } = qvd::read_schema(&path).map_err(|e| e.to_string())?;
-    for (name, tid) in names.iter().zip(type_ids.into_iter()) {
-        let mut lt = ffi::duckdb_create_logical_type(tid as ffi::duckdb_type);
-        let cname = CString::new(name.as_str()).map_err(|e| e.to_string())?;
-        ffi::duckdb_bind_add_result_column(info, cname.as_ptr(), lt);
-        ffi::duckdb_destroy_logical_type(&mut lt);
+    let Schema { mut names, mut kinds, type_ids } =
+        qvd::read_schema(&path).map_err(|e| e.to_string())?;
+
+    // En COPY FROM, les colonnes de sortie sont celles de la table cible (on ne
+    // les déclare pas) : les champs du QVD leur sont associés par position. L'API
+    // C V1 ne sait pas convertir une valeur : un type différent est une erreur.
+    let n = ffi::duckdb_table_function_bind_get_result_column_count(info) as usize;
+    if names.len() < n {
+        return Err(format!(
+            "COPY FROM (FORMAT qvd) : le fichier a {} champs pour {n} colonnes cibles",
+            names.len()
+        ));
     }
+    for (i, tid) in type_ids.into_iter().take(n).enumerate() {
+        let mut lt = ffi::duckdb_table_function_bind_get_result_column_type(info, i as u64);
+        let target = ffi::duckdb_get_type_id(lt);
+        ffi::duckdb_destroy_logical_type(&mut lt);
+        if target != tid as ffi::duckdb_type {
+            let col = CStr::from_ptr(ffi::duckdb_table_function_bind_get_result_column_name(info, i as u64))
+                .to_string_lossy();
+            return Err(format!(
+                "COPY FROM (FORMAT qvd) : la colonne '{col}' n'a pas le type du champ '{}' ({tid:?}) ; \
+                 utiliser INSERT INTO … SELECT … FROM read_qvd('{path}') pour convertir",
+                names[i]
+            ));
+        }
+    }
+    names.truncate(n);
+    kinds.truncate(n);
 
     Ok(CfBind { path, names, kinds })
 }
