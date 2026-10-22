@@ -1,0 +1,57 @@
+# name: test/sql/copy.test
+# description: COPY ... TO / FROM (FORMAT qvd) round-trips
+# group: [qvd]
+
+require qvd
+
+statement ok
+COPY (SELECT * FROM (VALUES
+    (1::BIGINT, 1.5::DOUBLE, 'a', DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05', TIME '12:30:00', INTERVAL 2 DAY, 3000000000::BIGINT, 12.34::DECIMAL(6,2), true),
+    (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)) t)
+TO '__WORKING_DIRECTORY__/build/all_types.qvd' (FORMAT qvd, FIELD_NAMES (i, d, s, dt, ts, tm, iv, big, dec, b));
+
+# Types come back from the Qlik tags written by COPY TO.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_qvd('__WORKING_DIRECTORY__/build/all_types.qvd'));
+----
+i	BIGINT
+d	DOUBLE
+s	VARCHAR
+dt	DATE
+ts	TIMESTAMP
+tm	TIME
+iv	INTERVAL
+big	BIGINT
+dec	DOUBLE
+b	BIGINT
+
+query IRTTTTTIRI
+SELECT * FROM read_qvd('__WORKING_DIRECTORY__/build/all_types.qvd');
+----
+1	1.5	a	2024-01-02	2024-01-02 03:04:05	12:30:00	2 days	3000000000	12.34	1
+NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+
+# FIELD_NAMES must match the column count.
+statement error
+COPY (SELECT 1) TO '__WORKING_DIRECTORY__/build/bad.qvd' (FORMAT qvd, FIELD_NAMES (a, b));
+----
+FIELD_NAMES
+
+# Unsupported types need an explicit CAST.
+statement error
+COPY (SELECT 1::HUGEINT) TO '__WORKING_DIRECTORY__/build/bad.qvd' (FORMAT qvd);
+----
+CAST
+
+# COPY FROM into a table with matching types.
+statement ok
+CREATE TABLE t (i BIGINT, d DOUBLE, s VARCHAR, dt DATE, ts TIMESTAMP, tm TIME, iv INTERVAL, big BIGINT, dec DOUBLE, b BIGINT);
+
+statement ok
+COPY t FROM '__WORKING_DIRECTORY__/build/all_types.qvd' (FORMAT qvd);
+
+query IRTTTTTIRI
+SELECT * FROM t ORDER BY i NULLS LAST;
+----
+1	1.5	a	2024-01-02	2024-01-02 03:04:05	12:30:00	2 days	3000000000	12.34	1
+NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
