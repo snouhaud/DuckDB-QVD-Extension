@@ -1,5 +1,5 @@
 [package]
-name = "qvd"
+name = "qvd_next"
 version = "1.0.6"
 edition = "2021"
 description = "Extension DuckDB pour lire les fichiers Qlik QVD via OpenQVD"

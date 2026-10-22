@@ -1,4 +1,21 @@
-# DuckDB `qvd` Extension — `read_qvd()` / `COPY TO (FORMAT qvd)`
+# DuckDB `qvd_next` Extension — `read_qvd()` / `COPY TO (FORMAT qvd)`
+
+> **`qvd_next`** is the next-generation build of the [`qvd`](https://github.com/snouhaud/DuckDB-QVD-Extension)
+> extension, on DuckDB's **C API v2** (via [`duckdb-neo`](https://crates.io/crates/duckdb-neo)).
+> Same SQL surface (`read_qvd`, `FORMAT qvd`), plus:
+> - `COPY ... TO` keeps the **query's column names** (`FIELD_NAMES` becomes an optional override);
+> - `COPY ... FROM` **casts** values to the target table's column types;
+> - `read_qvd(path)` is documented in `duckdb_functions()` (description, examples).
+>
+> Trade-off: the C API v2 is not stable yet, so a `qvd_next` binary loads on **one
+> exact DuckDB version** (2.0.0), and `duckdb-neo` is experimental. `qvd` (stable C
+> ABI, one binary for DuckDB 1.5.6 and 2.0.x) stays the conservative choice.
+> **Load only one of them per session**: both register `read_qvd` and `FORMAT qvd`.
+>
+> ```sql
+> INSTALL qvd_next FROM community;
+> LOAD qvd_next;
+> ```
 
 **100% Rust** DuckDB extension to **read and write** Qlik **QVD** files.
 **Reading** relies on [`qvd` (qvdrs)](https://github.com/bintocher/qvdrs)
@@ -85,8 +102,7 @@ Types are preserved and tagged for reading back (`BIGINT`/`DOUBLE`/`VARCHAR`/
 `DATE`/`TIMESTAMP`), `NULL` and UTF-8 are kept. Verified in a round-trip
 `read_qvd` → `COPY` → `read_qvd`.
 
-**Column names.** The C API of the copy function does not expose column names:
-by default the fields are `field0`, `field1`, … They can be supplied explicitly
+**Column names.** Fields take the query's column names. They can be overridden
 via the `FIELD_NAMES` option (both syntaxes are accepted):
 
 ```sql
@@ -112,9 +128,8 @@ CREATE TABLE sales(name VARCHAR, sale_date DATE, total BIGINT);
 COPY sales FROM 'sales.qvd' (FORMAT qvd);
 ```
 
-In the C API, `COPY ... FROM` delegates to a **table function**; since duckdb-rs
-does not expose the raw `duckdb_table_function` of a `VTab`, it is built in FFI
-in [`src/copy_from.rs`](src/copy_from.rs) and reuses the reading/typing of
+`COPY ... FROM` is the copy-from side of the `qvd` copy function
+([`src/copy_from.rs`](src/copy_from.rs)) and reuses the reading/typing of
 `read_qvd`. All types (including `DATE`/`TIME`/`INTERVAL`) and `NULL`s are
 restored; round-trip `COPY TO` → `COPY FROM` verified.
 
@@ -147,10 +162,7 @@ example with `LIMIT`/`OFFSET` or by partition) or export to another format.
 
 ### Column names in `COPY ... TO`
 
-The DuckDB C copy-function API does **not expose column names**, so by default
-the QVD fields are named `field0`, `field1`, `field2`, … regardless of the source
-column names. Use the `FIELD_NAMES` option to preserve meaningful names. Both
-syntaxes are accepted:
+Fields take the query's column names. The `FIELD_NAMES` option overrides them:
 
 ```sql
 COPY (SELECT id, amount, day FROM sales)
@@ -158,43 +170,6 @@ COPY (SELECT id, amount, day FROM sales)
 
 COPY (SELECT id, amount, day FROM sales)
   TO 'export.qvd' (FORMAT qvd, FIELD_NAMES ['id', 'amount', 'day']);
-```
-
-A common pattern is to query the column names from the result metadata and build
-the option dynamically. This works for a table, a CTE, or any query expression:
-
-```sql
--- build the field-name array from the output schema of the query
-SELECT list(column_name)
-FROM (DESCRIBE SELECT * FROM sales);
--- → [id, amount, sale_date]
-
--- then use that list in the COPY statement
-COPY (SELECT * FROM sales)
-  TO 'sales.qvd' (FORMAT qvd, FIELD_NAMES (SELECT list(column_name)
-                                           FROM (DESCRIBE SELECT * FROM sales)));
-```
-
-You can use the same pattern with arbitrary expressions (CTEs, joins, computed
-columns, aliases). Just make sure the inner query inside `COPY` and the query
-inside `DESCRIBE` produce the **same columns in the same order**:
-
-```sql
-WITH enriched AS (
-    SELECT
-        s.id,
-        s.amount,
-        c.category,
-        s.sale_date,
-        s.amount * 0.2 AS vat_amount
-    FROM sales s
-    JOIN categories c ON c.id = s.category_id
-)
-COPY (SELECT * FROM enriched)
-  TO 'enriched_sales.qvd' (
-    FORMAT qvd,
-    FIELD_NAMES (SELECT list(column_name) FROM (DESCRIBE SELECT * FROM enriched))
-  );
 ```
 
 The number of names must exactly match the number of output columns, otherwise
@@ -311,7 +286,7 @@ To test on real QVDs: drop files into `test/data/` and adapt
 - [x] Projection pushdown via `from_path_projected` (only useful columns decoded).
 - [x] Glob `read_qvd('data/*.qvd')` (concatenated rows, resolution by name).
 - [x] Writing `COPY ... TO ... (FORMAT qvd)` (FFI copy function; round-trip verified).
-- [x] Preserve column names on write (`FIELD_NAMES` option).
+- [x] Preserve column names on write (query names, `FIELD_NAMES` override).
 - [x] Writing `DECIMAL`s (all widths i16/i32/i64/i128 → DOUBLE).
 - [x] Writing `TIME`/`INTERVAL` (full temporal round-trip verified).
 - [x] Import `COPY table FROM 'x.qvd'` (FFI table function; round-trip verified).

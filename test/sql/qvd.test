@@ -2,7 +2,7 @@
 # description: Read a sample QVD file via read_qvd
 # group: [qvd]
 
-require qvd
+require qvd_next
 
 # Orders.qvd: 5 rows, columns orders.id/user_id/product_id/quantity/order_date.
 query I

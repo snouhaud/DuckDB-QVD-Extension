@@ -184,9 +184,9 @@ fn expand_glob(pattern: &str) -> std::result::Result<Vec<String>, Box<dyn std::e
     Ok(paths)
 }
 
-/// Point d'entrée (`qvd_init_c_api_v2`) : enregistre la table function
+/// Point d'entrée (`qvd_next_init_c_api_v2`) : enregistre la table function
 /// `read_qvd` et la copy function `qvd` (COPY TO et COPY FROM).
-#[duckdb_entrypoint_c_api_v2(extension_name = "qvd", api_version = "v2.0.0")]
+#[duckdb_entrypoint_c_api_v2(extension_name = "qvd_next", api_version = "v2.0.0")]
 fn entrypoint(extension: &Extension) -> Result<()> {
     TableFunctionBuilder::new(
         "read_qvd",

@@ -1,7 +1,7 @@
 # Rust DuckDB extension based on the C Extension API.
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-EXTENSION_NAME=qvd
+EXTENSION_NAME=qvd_next
 
 # C API v2 (duckdb-neo) : pas encore de surface stable, donc ABI unstable
 # (C_STRUCT_UNSTABLE) — le binaire ne charge que sur TARGET_DUCKDB_VERSION exacte.

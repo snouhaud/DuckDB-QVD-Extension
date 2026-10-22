@@ -2,7 +2,7 @@
 # description: COPY ... TO / FROM (FORMAT qvd) round-trips
 # group: [qvd]
 
-require qvd
+require qvd_next
 
 statement ok
 COPY (SELECT * FROM (VALUES

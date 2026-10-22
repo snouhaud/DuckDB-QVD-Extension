@@ -2,7 +2,7 @@
 # description: Tests for the read_qvd table function
 # group: [qvd]
 
-require qvd
+require qvd_next
 
 # A nonexistent file must make the query fail cleanly.
 statement error
