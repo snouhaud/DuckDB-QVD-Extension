@@ -163,12 +163,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glob"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
-
-[[package]]
 name = "http"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -340,7 +334,6 @@ version = "1.0.6"
 dependencies = [
  "duckdb-loadable-macros",
  "duckdb-neo",
- "glob",
  "openqvd",
  "qvd",
 ]

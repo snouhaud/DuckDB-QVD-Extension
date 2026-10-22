@@ -2,8 +2,9 @@
 //!
 //! Copy function de la C API v2 (`duckdb-neo`) : `bind` (noms + types des
 //! colonnes) → `init` (chemin + tampons) → `batch`/`flush` (accumulation des
-//! lots, dans l'ordre) → `finalize` (écriture via le writer OpenQVD). Toutes les
-//! lignes sont accumulées en mémoire avant l'écriture.
+//! lots, dans l'ordre) → `finalize` (encodage OpenQVD, écrit via le système de
+//! fichiers virtuel de DuckDB : local ou distant). Toutes les lignes sont
+//! accumulées en mémoire avant l'écriture.
 //!
 //! Les noms de colonnes viennent de la requête ; l'option `FIELD_NAMES` permet
 //! de les remplacer. Les types sont taggés pour que [`crate::qvd`] les relise
@@ -16,6 +17,7 @@ use duckdb_neo::{
     connection::Context,
     copy_function::{CopyToBindInfo, CopyToFunctionCallbacks},
     data_chunk::DataChunkRef,
+    file::{FileBuilder, FileSystem},
     logical_type::{LogicalType, LogicalTypeID},
     types::{
         DateValue, DecimalSignature, HugeDecimal, IntervalValue, LongDecimal, ShortDecimal, TimeValue,
@@ -263,7 +265,7 @@ impl CopyToFunctionCallbacks for QvdFormat {
         Ok(())
     }
 
-    fn finalize(&self, _context: &Context, bind: &Self::BindData, state: &Self::InitData) -> Result<()> {
+    fn finalize(&self, context: &Context, bind: &Self::BindData, state: &Self::InitData) -> Result<()> {
         let columns = std::mem::take(&mut *state.columns.lock().map_err(err)?);
         let cols = bind
             .names
@@ -276,6 +278,17 @@ impl CopyToFunctionCallbacks for QvdFormat {
                 col
             })
             .collect();
-        WriteTable::new("qvd", cols).map_err(err)?.write_to_path(&state.path).map_err(err)
+        let bytes = WriteTable::new("qvd", cols).map_err(err)?.to_bytes().map_err(err)?;
+
+        let fs = FileSystem::new(context)?;
+        let file = FileBuilder::new(&fs, &state.path)?.write().create_new().open()?;
+        let mut rest = &bytes[..];
+        while !rest.is_empty() {
+            match file.write(rest)? {
+                0 => return Err(Error::invalid_input(format!("écriture interrompue : {}", state.path))),
+                n => rest = &rest[n..],
+            }
+        }
+        file.close()
     }
 }

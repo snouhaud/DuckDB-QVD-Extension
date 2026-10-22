@@ -36,3 +36,9 @@ SELECT function_type, parameters::VARCHAR, description IS NOT NULL, len(examples
 FROM duckdb_functions() WHERE function_name = 'read_qvd';
 ----
 table	[path]	true	2
+
+# Glob through DuckDB's file system: rows of every match, concatenated.
+query I
+SELECT count(*) FROM read_qvd('QVD-Examples/*.qvd');
+----
+17

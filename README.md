@@ -87,7 +87,28 @@ SELECT * FROM read_qvd('data/sales_*.qvd');
 The pattern is expanded (sorted) and rows from all files are **concatenated**.
 The schema is that of the **first file**; within each file fields are resolved
 **by name** (robust to column-ordering differences), with a missing field coming
-out as `NULL`. A pattern with no match raises an error.
+out as `NULL`. A pattern with no match raises an error. Globbing is DuckDB's own
+(`*`, `**`, `?`, `[...]`), so it also works on remote storage.
+
+### Remote files (S3, HTTP(S), Azure, …)
+
+All I/O goes through **DuckDB's virtual file system**: any path DuckDB can open
+works for `read_qvd`, `COPY ... TO` and `COPY ... FROM`, once the matching
+extension is loaded (`httpfs` for `s3://`, `http(s)://`, `azure` for `az://`…).
+
+```sql
+LOAD httpfs;
+CREATE SECRET (TYPE s3, KEY_ID '…', SECRET '…', REGION '…');
+
+SELECT * FROM read_qvd('s3://bucket/sales/*.qvd');
+COPY (SELECT * FROM sales) TO 's3://bucket/out/sales.qvd' (FORMAT qvd);
+COPY sales FROM 's3://bucket/out/sales.qvd' (FORMAT qvd);
+```
+
+Remote reads use ranged requests and DuckDB's external file cache: only the
+projected columns' symbol tables are fetched (plus the record index block, which
+interleaves all fields). Verified against an S3-compatible store (RustFS): on a
+399 MB file, `sum(k)` over one column transferred 51 MB, all columns 399 MB.
 
 ### Writing: `COPY ... TO ... (FORMAT qvd)`
 
@@ -95,9 +116,9 @@ out as `NULL`. A pattern with no match raises an error.
 COPY (SELECT id, amount, sale_date FROM sales) TO 'export.qvd' (FORMAT qvd);
 ```
 
-Implemented via a **copy function** of the C API (not wrapped by duckdb-rs,
-driven in FFI in [`src/copy.rs`](src/copy.rs)): `bind` (types) →
-`global_init` (path) → `sink` (accumulation) → `finalize` (OpenQVD write).
+Implemented as a **copy function** of the C API v2 ([`src/copy.rs`](src/copy.rs)):
+`bind` (names, types) → `init` (path) → `batch`/`flush` (accumulation) →
+`finalize` (OpenQVD encoding, written through DuckDB's file system).
 Types are preserved and tagged for reading back (`BIGINT`/`DOUBLE`/`VARCHAR`/
 `DATE`/`TIMESTAMP`), `NULL` and UTF-8 are kept. Verified in a round-trip
 `read_qvd` → `COPY` → `read_qvd`.
@@ -147,7 +168,8 @@ target column types when they differ from the types `read_qvd` infers.
   read in full (fields are bit-interleaved in each record — a QVD format trait), but
   warm that is cheap; the former bottleneck was extracting all columns' bits.
 - **Writing** (`COPY TO`) still accumulates all rows in memory (OpenQVD writer).
-- Local glob only (no DuckDB file system: neither httpfs nor S3).
+- Remote reads issue one ranged request per 2048-row index chunk (latency-bound
+  on high-latency storage).
 
 ## Important limitations and behaviour notes
 

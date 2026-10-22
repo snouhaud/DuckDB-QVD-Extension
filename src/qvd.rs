@@ -34,8 +34,15 @@ use std::sync::Mutex;
 
 use qvdrs::header::{QvdFieldHeader, QvdTableHeader};
 use qvdrs::{QvdSymbol, QvdValue};
-use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+
+/// Source lisible d'un QVD : fichier local (tests) ou fichier du système de
+/// fichiers virtuel de DuckDB (local, `s3://`, `https://`…).
+pub(crate) trait Source: Read + Seek + Send {}
+impl<T: Read + Seek + Send> Source for T {}
+
+/// Ouvre un chemin en lecture.
+pub(crate) type Open<'a> = &'a dyn Fn(&str) -> std::io::Result<Box<dyn Source>>;
 
 /// Nombre max de lignes décodées par chunk.
 const VECTOR_SIZE: usize = 2048;
@@ -89,8 +96,8 @@ pub(crate) const MICROS_PER_DAY: f64 = 86_400_000_000.0;
 /// toucher aux tables de symboles ni à l'index. Renvoie le fichier (positionné de
 /// façon quelconque — toujours reseek en absolu ensuite), l'en-tête parsé, et
 /// `binary_start` = offset absolu du début de la section binaire.
-fn read_header(path: &str) -> Result<(File, QvdTableHeader, u64), Box<dyn Error>> {
-    let mut file = File::open(path)?;
+fn read_header(path: &str, open: Open) -> Result<(Box<dyn Source>, QvdTableHeader, u64), Box<dyn Error>> {
+    let mut file = open(path)?;
     let mut xml = Vec::new();
     {
         let mut br = BufReader::new(&mut file);
@@ -105,8 +112,8 @@ fn read_header(path: &str) -> Result<(File, QvdTableHeader, u64), Box<dyn Error>
 }
 
 /// Lit uniquement le schéma (en-tête) d'un QVD, sans décoder l'index ni les symboles.
-pub(crate) fn read_schema(path: &str) -> Result<Schema, Box<dyn Error>> {
-    let (_file, header, _bs) = read_header(path)?;
+pub(crate) fn read_schema(path: &str, open: Open) -> Result<Schema, Box<dyn Error>> {
+    let (_file, header, _bs) = read_header(path, open)?;
     let mut names = Vec::new();
     let mut kinds = Vec::new();
     for f in &header.fields {
@@ -122,7 +129,7 @@ struct ScanState {
     file_idx: usize,
     countstar_emitted: usize,
     // Fichier courant ouvert (None tant qu'un fichier n'est pas entamé).
-    file: Option<File>,
+    file: Option<Box<dyn Source>>,
     /// Colonne projetée -> en-tête de son champ dans le fichier courant
     /// (None si le champ est absent → la colonne sort en `NULL`).
     fields: Vec<Option<QvdFieldHeader>>,
@@ -166,12 +173,13 @@ impl QvdScan {
         names: &[String],
         kinds: &[Kind],
         indices: &[usize],
+        open: Open,
     ) -> Result<Self, Box<dyn Error>> {
         let needed_names = indices.iter().map(|&i| names[i].clone()).collect();
         let needed_kinds = indices.iter().map(|&i| kinds[i]).collect();
         let mut num_rows = 0usize;
         for p in paths {
-            num_rows += read_header(p)?.1.no_of_records;
+            num_rows += read_header(p, open)?.1.no_of_records;
         }
         Ok(QvdScan {
             paths: paths.to_vec(),
@@ -199,8 +207,8 @@ impl QvdScan {
 
     /// Ouvre le fichier courant : en-tête seul, dictionnaires des colonnes projetées
     /// (symboles convertis une fois), et en-têtes de champ projetés. Stocke l'état.
-    fn open_current(&self, st: &mut ScanState) -> Result<(), Box<dyn Error>> {
-        let (mut file, header, binary_start) = read_header(&self.paths[st.file_idx])?;
+    fn open_current(&self, st: &mut ScanState, open: Open) -> Result<(), Box<dyn Error>> {
+        let (mut file, header, binary_start) = read_header(&self.paths[st.file_idx], open)?;
 
         // Résolution par nom (None si champ absent → colonne en NULL).
         let positions: Vec<Option<usize>> = self
@@ -291,7 +299,7 @@ impl QvdScan {
 
     /// Tire le prochain paquet de lignes (un chunk d'un fichier), en traversant les
     /// fichiers du glob. L'état avance sous verrou ; les données rendues sont possédées.
-    pub(crate) fn pull(&self) -> Result<Pull, Box<dyn Error>> {
+    pub(crate) fn pull(&self, open: Open) -> Result<Pull, Box<dyn Error>> {
         let mut st = self.state.lock().unwrap();
 
         // COUNT(*) : 0 colonne projetée → ne rien décoder (compté depuis l'en-tête).
@@ -309,7 +317,7 @@ impl QvdScan {
                 if st.file_idx >= self.paths.len() {
                     return Ok(Pull::Done);
                 }
-                self.open_current(&mut st)?;
+                self.open_current(&mut st, open)?;
             }
 
             if st.row >= st.file_rows {
@@ -474,6 +482,11 @@ mod tests {
     use super::*;
     use openqvd::{Column, Value, WriteTable};
 
+    /// Ouverture locale (std::fs) pour les tests, sans DuckDB.
+    fn local(path: &str) -> std::io::Result<Box<dyn Source>> {
+        Ok(Box::new(std::fs::File::open(path)?))
+    }
+
     /// Colonne openqvd avec ses tags Qlik (génération des fichiers de test).
     fn tagged(name: &str, values: Vec<Option<Value>>, tags: &[&str]) -> Column {
         let mut c = Column::new(name, values);
@@ -531,12 +544,12 @@ mod tests {
 
     /// Draine un scan en colonnes typées, pour pouvoir asserter sur les valeurs.
     fn collect(paths: &[String], names: &[String], kinds: &[Kind], indices: &[usize]) -> (Vec<TestCol>, usize) {
-        let scan = QvdScan::new(paths, names, kinds, indices).unwrap();
+        let scan = QvdScan::new(paths, names, kinds, indices, &local).unwrap();
         let out_kinds: Vec<Kind> = indices.iter().map(|&i| kinds[i]).collect();
         let mut cols: Vec<TestCol> = out_kinds.iter().map(|&k| TestCol::empty(k)).collect();
         let mut total = 0usize;
         loop {
-            match scan.pull().unwrap() {
+            match scan.pull(&local).unwrap() {
                 Pull::Done => break,
                 Pull::Rows(n) => total += n,
                 Pull::Cells { columns } => {
@@ -564,7 +577,7 @@ mod tests {
             tagged("qty", vec![Some(Value::Int(10)), Some(Value::Int(10))], &["$integer"]),
         ];
         let path = write_temp("qvdrs_proj_test.qvd", cols);
-        let s = read_schema(&path).unwrap();
+        let s = read_schema(&path, &local).unwrap();
 
         // Projection inversée (qty, name, dur, t, day) pour exercer le mapping.
         let (c, n) = collect(&[path], &s.names, &s.kinds, &[4, 3, 2, 1, 0]);
@@ -581,7 +594,7 @@ mod tests {
 
     /// Lit schéma + toutes les colonnes (projection = tous les champs).
     fn read_all(path: &str) -> (Vec<String>, Vec<Kind>, Vec<TestCol>, usize) {
-        let s = read_schema(path).unwrap();
+        let s = read_schema(path, &local).unwrap();
         let indices: Vec<usize> = (0..s.names.len()).collect();
         let (cols, n) = collect(&[path.to_string()], &s.names, &s.kinds, &indices);
         (s.names, s.kinds, cols, n)
@@ -653,7 +666,7 @@ mod tests {
         ];
         let path = write_temp("qvdrs_projection_test.qvd", cols);
 
-        let s = read_schema(&path).unwrap();
+        let s = read_schema(&path, &local).unwrap();
         assert_eq!(s.names, ["a", "b", "c"]);
 
         // Projeter c puis a (ordre inversé, b exclue).
@@ -684,7 +697,7 @@ mod tests {
         let p1 = write_temp("qvdrs_multi_1.qvd", f1);
         let p2 = write_temp("qvdrs_multi_2.qvd", f2);
 
-        let s = read_schema(&p1).unwrap();
+        let s = read_schema(&p1, &local).unwrap();
         let indices: Vec<usize> = (0..s.names.len()).collect();
         let (columns, n) = collect(&[p1, p2], &s.names, &s.kinds, &indices);
 
@@ -752,7 +765,7 @@ mod tests {
         let path = write_temp("qvdrs_bounds_test.qvd", vec![tagged("a", big, &["$text"]), tagged("b", small, &["$integer"])]);
 
         // Déplace l'Offset du champ `b` à la fin de la section des symboles.
-        let (_f, header, _bs) = read_header(&path).unwrap();
+        let (_f, header, _bs) = read_header(&path, &local).unwrap();
         let mut bytes = std::fs::read(&path).unwrap();
         let field_b = find(&bytes, b"<FieldName>b</FieldName>");
         let start = field_b + find(&bytes[field_b..], b"<Offset>") + b"<Offset>".len();
@@ -760,9 +773,9 @@ mod tests {
         bytes.splice(start..end, header.offset.to_string().into_bytes());
         std::fs::write(&path, bytes).unwrap();
 
-        let s = read_schema(&path).unwrap();
-        let res = QvdScan::new(std::slice::from_ref(&path), &s.names, &s.kinds, &[1]).and_then(|scan| {
-            while !matches!(scan.pull()?, Pull::Done) {}
+        let s = read_schema(&path, &local).unwrap();
+        let res = QvdScan::new(std::slice::from_ref(&path), &s.names, &s.kinds, &[1], &local).and_then(|scan| {
+            while !matches!(scan.pull(&local)?, Pull::Done) {}
             Ok(())
         });
         assert!(res.unwrap_err().to_string().contains("hors de la section"));

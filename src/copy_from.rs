@@ -17,7 +17,7 @@ use duckdb_neo::{
 
 use crate::copy::QvdFormat;
 use crate::qvd::{self, Cell, Kind, Pull, QvdScan};
-use crate::{err, logical_type, write_cells};
+use crate::{err, logical_type, vfs_open, write_cells};
 
 /// Données de bind : fichier, champs lus (les `n` premiers, `n` = nombre de
 /// colonnes cibles) et, pour chacun, le type cible quand il diffère du type lu.
@@ -40,7 +40,7 @@ impl CopyFromFunctionCallbacks for QvdFormat {
         file_path: &str,
         info: &CopyFromBindInfo,
     ) -> Result<(Self::BindData, Option<CopyFromCardinality>)> {
-        let schema = qvd::read_schema(file_path).map_err(err)?;
+        let schema = qvd::read_schema(file_path, &vfs_open(context)).map_err(err)?;
         let n = info.column_count()?;
         if schema.names.len() < n {
             return Err(Error::invalid_input(format!(
@@ -69,10 +69,11 @@ impl CopyFromFunctionCallbacks for QvdFormat {
     fn init_global_state(
         &self,
         bind: &Self::BindData,
-        _context: &Context,
+        context: &Context,
     ) -> Result<(Option<Self::GlobalState>, Option<std::num::NonZeroUsize>)> {
         let indices: Vec<usize> = (0..bind.kinds.len()).collect();
-        let scan = QvdScan::new(std::slice::from_ref(&bind.path), &bind.names, &bind.kinds, &indices).map_err(err)?;
+        let scan = QvdScan::new(std::slice::from_ref(&bind.path), &bind.names, &bind.kinds, &indices, &vfs_open(context))
+            .map_err(err)?;
         Ok((Some(scan), std::num::NonZeroUsize::new(1)))
     }
 
@@ -86,7 +87,7 @@ impl CopyFromFunctionCallbacks for QvdFormat {
         mut output: DataChunkRef<'_>,
     ) -> Result<()> {
         let scan = scan.ok_or_else(|| Error::internal("COPY FROM qvd : état de scan absent"))?;
-        let Pull::Cells { columns } = scan.pull().map_err(err)? else {
+        let Pull::Cells { columns } = scan.pull(&vfs_open(context)).map_err(err)? else {
             return Ok(());
         };
         for (j, cells) in columns.iter().enumerate() {

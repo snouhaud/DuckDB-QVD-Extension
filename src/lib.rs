@@ -10,6 +10,7 @@ mod copy_from;
 mod qvd;
 
 use std::fmt::Display;
+use std::io::{self, Read, Seek, SeekFrom};
 
 use duckdb_loadable_macros::duckdb_entrypoint_c_api_v2;
 use duckdb_neo::{
@@ -18,6 +19,7 @@ use duckdb_neo::{
     copy_function::CopyFunctionBuilder,
     data_chunk::DataChunkRef,
     extension::Extension,
+    file::{File, FileBuilder, FileSystem},
     logical_type::LogicalType,
     signature::{FunctionDocumentationBuilder, FunctionParameter, SignatureBuilder},
     table_function::{
@@ -29,7 +31,7 @@ use duckdb_neo::{
     DuckDBType, Error, Result,
 };
 
-use qvd::{Cell, Kind, Pull, QvdScan};
+use qvd::{Cell, Kind, Pull, QvdScan, Source};
 
 /// Données produites par `bind` : la liste des fichiers (glob déployé) et le
 /// schéma complet (sans données). La lecture effective (streaming) n'a lieu
@@ -61,9 +63,9 @@ impl TableFunctionCallbacks for ReadQvd {
             .and_then(|v| v.get::<String>().transpose())
             .transpose()?
             .ok_or_else(|| Error::invalid_input("read_qvd : chemin NULL"))?;
-        let paths = expand_glob(&pattern).map_err(err)?;
+        let paths = expand_glob(context, &pattern)?;
 
-        let schema = qvd::read_schema(&paths[0]).map_err(err)?;
+        let schema = qvd::read_schema(&paths[0], &vfs_open(context)).map_err(err)?;
         for (name, &kind) in schema.names.iter().zip(&schema.kinds) {
             bind.add_result_column(name, &logical_type(kind, context)?)?;
         }
@@ -76,13 +78,13 @@ impl TableFunctionCallbacks for ReadQvd {
     fn init_global_state(
         &self,
         bind: &Self::BindData,
-        _context: &Context,
+        context: &Context,
         columns: InitColumnData<'_>,
     ) -> Result<(Option<Self::GlobalState>, Option<usize>)> {
         let indices = (0..columns.count()?)
             .map(|i| columns.get_column_index(i))
             .collect::<Result<Vec<_>>>()?;
-        let scan = QvdScan::new(&bind.paths, &bind.names, &bind.kinds, &indices).map_err(err)?;
+        let scan = QvdScan::new(&bind.paths, &bind.names, &bind.kinds, &indices, &vfs_open(context)).map_err(err)?;
         Ok((Some(scan), Some(1)))
     }
 
@@ -93,12 +95,12 @@ impl TableFunctionCallbacks for ReadQvd {
         _bind: &Self::BindData,
         scan: Option<&Self::GlobalState>,
         _local: Option<&mut Self::LocalState>,
-        _context: &Context,
+        context: &Context,
         mut output: DataChunkRef<'_>,
         _columns: ExecColumnInfo<'_>,
     ) -> Result<()> {
         let scan = scan.ok_or_else(|| Error::internal("read_qvd : état de scan absent"))?;
-        match scan.pull().map_err(err)? {
+        match scan.pull(&vfs_open(context)).map_err(err)? {
             Pull::Done => {}
             // DuckDB demande toujours au moins une colonne (même pour COUNT(*)) :
             // ce cas ne survient pas, mais reste géré par `QvdScan`.
@@ -170,18 +172,55 @@ pub(crate) fn err(e: impl Display) -> Error {
     Error::invalid_input(e.to_string())
 }
 
-/// Déploie un motif glob en liste de fichiers triée. Un chemin littéral sans
-/// métacaractère se résout en lui-même (s'il existe). Erreur si aucun match.
-fn expand_glob(pattern: &str) -> std::result::Result<Vec<String>, Box<dyn std::error::Error>> {
-    let mut paths = Vec::new();
-    for entry in glob::glob(pattern)? {
-        paths.push(entry?.to_string_lossy().into_owned());
-    }
+/// Déploie un motif via le glob de DuckDB (local ou distant : `s3://`, …), trié.
+/// Un chemin littéral se résout en lui-même s'il existe. Erreur si aucun match.
+fn expand_glob(context: &Context, pattern: &str) -> Result<Vec<String>> {
+    let mut paths = FileSystem::new(context)?.glob(pattern)?;
     paths.sort();
     if paths.is_empty() {
-        return Err(format!("aucun fichier ne correspond au motif '{pattern}'").into());
+        return Err(Error::invalid_input(format!("aucun fichier ne correspond au motif '{pattern}'")));
     }
     Ok(paths)
+}
+
+/// Ouverture en lecture via le système de fichiers virtuel de DuckDB : fichiers
+/// locaux comme distants (`s3://`, `https://`… une fois httpfs chargé).
+pub(crate) fn vfs_open(context: &Context) -> impl Fn(&str) -> io::Result<Box<dyn Source>> + '_ {
+    move |path| {
+        let fs = FileSystem::new(context).map_err(io_err)?;
+        // Le cache de fichiers externes de DuckDB n'aide que pour les fichiers distants.
+        let remote = fs.is_remote(path).map_err(io_err)?;
+        let file = FileBuilder::new(&fs, path)
+            .and_then(|b| if remote { b.read().external_file_cache() } else { b.read() }.open())
+            .map_err(io_err)?;
+        Ok(Box::new(DuckFile(file)))
+    }
+}
+
+/// Fichier du VFS DuckDB vu comme `Read + Seek` (curseur unique du fichier).
+struct DuckFile(File);
+
+impl Read for DuckFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read_into(buf).map_err(io_err)
+    }
+}
+
+impl Seek for DuckFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let (base, delta) = match pos {
+            SeekFrom::Start(n) => (n, 0),
+            SeekFrom::Current(d) => (self.0.tell().map_err(io_err)?, d),
+            SeekFrom::End(d) => (self.0.size().map_err(io_err)?, d),
+        };
+        let target = base.checked_add_signed(delta).ok_or_else(|| io::Error::other("seek hors fichier"))?;
+        self.0.seek(target as usize).map_err(io_err)?;
+        Ok(target)
+    }
+}
+
+pub(crate) fn io_err(e: Error) -> io::Error {
+    io::Error::other(e.to_string())
 }
 
 /// Point d'entrée (`qvd_next_init_c_api_v2`) : enregistre la table function
