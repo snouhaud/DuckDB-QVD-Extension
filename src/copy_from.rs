@@ -69,11 +69,10 @@ impl CopyFromFunctionCallbacks for QvdFormat {
     fn init_global_state(
         &self,
         bind: &Self::BindData,
-        context: &Context,
+        _context: &Context,
     ) -> Result<(Option<Self::GlobalState>, Option<std::num::NonZeroUsize>)> {
         let indices: Vec<usize> = (0..bind.kinds.len()).collect();
-        let scan = QvdScan::new(std::slice::from_ref(&bind.path), &bind.names, &bind.kinds, &indices, &vfs_open(context))
-            .map_err(err)?;
+        let scan = QvdScan::new(std::slice::from_ref(&bind.path), &bind.names, &bind.kinds, &indices).map_err(err)?;
         Ok((Some(scan), std::num::NonZeroUsize::new(1)))
     }
 

@@ -169,7 +169,6 @@ pub(crate) fn read_schema(path: &str, open: Open) -> Result<Schema, Box<dyn Erro
 /// État mutable d'un scan (un fichier ouvert à la fois pour le glob).
 struct ScanState {
     file_idx: usize,
-    countstar_emitted: usize,
     // Fichier courant ouvert (None tant qu'un fichier n'est pas entamé).
     file: Option<Box<dyn Source>>,
     /// Colonne projetée -> en-tête de son champ dans le fichier courant
@@ -188,8 +187,6 @@ struct ScanState {
 
 /// Un paquet de lignes tiré du scan.
 pub(crate) enum Pull {
-    /// `COUNT(*)` : `n` lignes sans aucune colonne.
-    Rows(usize),
     /// Données : colonnes projetées déjà converties (un chunk, possédées).
     Cells { columns: Vec<Vec<Cell>> },
     /// Scan terminé.
@@ -206,34 +203,27 @@ pub(crate) struct QvdScan {
     paths: Vec<String>,
     needed_names: Vec<String>,
     needed_kinds: Vec<Kind>,
-    num_rows: usize,
     state: Mutex<ScanState>,
 }
 
 impl QvdScan {
-    /// Prépare le scan (aucun décodage ici). `num_rows` est lu dans les **en-têtes**
-    /// seuls (pour `COUNT(*)`), sans toucher symboles ni index.
+    /// Prépare le scan (aucune lecture ici : chaque fichier est ouvert à son tour
+    /// par `pull`). DuckDB demande toujours au moins une colonne à une table
+    /// function, `COUNT(*)` compris.
     pub(crate) fn new(
         paths: &[String],
         names: &[String],
         kinds: &[Kind],
         indices: &[usize],
-        open: Open,
     ) -> Result<Self, Box<dyn Error>> {
         let needed_names = indices.iter().map(|&i| names[i].clone()).collect();
         let needed_kinds = indices.iter().map(|&i| kinds[i]).collect();
-        let mut num_rows = 0usize;
-        for p in paths {
-            num_rows += read_header(p, open)?.1.no_of_records;
-        }
         Ok(QvdScan {
             paths: paths.to_vec(),
             needed_names,
             needed_kinds,
-            num_rows,
             state: Mutex::new(ScanState {
                 file_idx: 0,
-                countstar_emitted: 0,
                 file: None,
                 fields: Vec::new(),
                 dicts: Vec::new(),
@@ -340,16 +330,6 @@ impl QvdScan {
     /// fichiers du glob. L'état avance sous verrou ; les données rendues sont possédées.
     pub(crate) fn pull(&self, open: Open) -> Result<Pull, Box<dyn Error>> {
         let mut st = self.state.lock().unwrap();
-
-        // COUNT(*) : 0 colonne projetée → ne rien décoder (compté depuis l'en-tête).
-        if self.needed_kinds.is_empty() {
-            let n = (self.num_rows - st.countstar_emitted).min(VECTOR_SIZE);
-            if n == 0 {
-                return Ok(Pull::Done);
-            }
-            st.countstar_emitted += n;
-            return Ok(Pull::Rows(n));
-        }
 
         loop {
             if st.file.is_none() {
@@ -594,14 +574,13 @@ mod tests {
 
     /// Draine un scan en colonnes typées, pour pouvoir asserter sur les valeurs.
     fn collect(paths: &[String], names: &[String], kinds: &[Kind], indices: &[usize]) -> (Vec<TestCol>, usize) {
-        let scan = QvdScan::new(paths, names, kinds, indices, &local).unwrap();
+        let scan = QvdScan::new(paths, names, kinds, indices).unwrap();
         let out_kinds: Vec<Kind> = indices.iter().map(|&i| kinds[i]).collect();
         let mut cols: Vec<TestCol> = out_kinds.iter().map(|&k| TestCol::empty(k)).collect();
         let mut total = 0usize;
         loop {
             match scan.pull(&local).unwrap() {
                 Pull::Done => break,
-                Pull::Rows(n) => total += n,
                 Pull::Cells { columns } => {
                     total += columns.first().map_or(0, |c| c.len());
                     for (j, col) in cols.iter_mut().enumerate() {
@@ -849,7 +828,7 @@ mod tests {
         bytes[nul - 1] = 0xFF;
         std::fs::write(&path, bytes).unwrap();
         let s = read_schema(&path, &local).unwrap();
-        let res = QvdScan::new(std::slice::from_ref(&path), &s.names, &s.kinds, &[0], &local).and_then(|scan| {
+        let res = QvdScan::new(std::slice::from_ref(&path), &s.names, &s.kinds, &[0]).and_then(|scan| {
             while !matches!(scan.pull(&local)?, Pull::Done) {}
             Ok(())
         });

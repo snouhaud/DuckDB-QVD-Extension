@@ -78,13 +78,13 @@ impl TableFunctionCallbacks for ReadQvd {
     fn init_global_state(
         &self,
         bind: &Self::BindData,
-        context: &Context,
+        _context: &Context,
         columns: InitColumnData<'_>,
     ) -> Result<(Option<Self::GlobalState>, Option<usize>)> {
         let indices = (0..columns.count()?)
             .map(|i| columns.get_column_index(i))
             .collect::<Result<Vec<_>>>()?;
-        let scan = QvdScan::new(&bind.paths, &bind.names, &bind.kinds, &indices, &vfs_open(context)).map_err(err)?;
+        let scan = QvdScan::new(&bind.paths, &bind.names, &bind.kinds, &indices).map_err(err)?;
         Ok((Some(scan), Some(1)))
     }
 
@@ -102,9 +102,6 @@ impl TableFunctionCallbacks for ReadQvd {
         let scan = scan.ok_or_else(|| Error::internal("read_qvd : état de scan absent"))?;
         match scan.pull(&vfs_open(context)).map_err(err)? {
             Pull::Done => {}
-            // DuckDB demande toujours au moins une colonne (même pour COUNT(*)) :
-            // ce cas ne survient pas, mais reste géré par `QvdScan`.
-            Pull::Rows(_) => {}
             Pull::Cells { columns } => {
                 for (j, &kind) in scan.output_kinds().iter().enumerate() {
                     write_cells(&mut output, j, kind, &columns[j])?;
