@@ -11,6 +11,7 @@ use std::ffi::{c_void, CStr, CString};
 use duckdb::ffi;
 
 use crate::qvd::{self, Cell, IntervalVal, Kind, Pull, QvdScan, Schema};
+use crate::copy::guard;
 
 struct CfBind {
     path: String,
@@ -28,6 +29,13 @@ unsafe extern "C" fn destroy_init(data: *mut c_void) {
 
 /// `bind` : lit le chemin (1er paramètre) et vérifie le schéma de la table cible.
 unsafe extern "C" fn cf_bind(info: ffi::duckdb_bind_info) {
+    guard(|| cf_bind_body(info), |msg| {
+        let c = CString::new(msg).unwrap_or_default();
+        ffi::duckdb_bind_set_error(info, c.as_ptr());
+    });
+}
+
+unsafe fn cf_bind_body(info: ffi::duckdb_bind_info) {
     match bind_inner(info) {
         Ok(bind) => {
             let ptr = Box::into_raw(Box::new(bind));
@@ -87,6 +95,13 @@ unsafe fn bind_inner(info: ffi::duckdb_bind_info) -> Result<CfBind, String> {
 
 /// `init` : prépare le scan streaming (un seul fichier).
 unsafe extern "C" fn cf_init(info: ffi::duckdb_init_info) {
+    guard(|| cf_init_body(info), |msg| {
+        let c = CString::new(msg).unwrap_or_default();
+        ffi::duckdb_init_set_error(info, c.as_ptr());
+    });
+}
+
+unsafe fn cf_init_body(info: ffi::duckdb_init_info) {
     let bind = &*(ffi::duckdb_init_get_bind_data(info) as *const CfBind);
     let indices: Vec<usize> = (0..bind.names.len()).collect();
     match QvdScan::new(std::slice::from_ref(&bind.path), &bind.names, &bind.kinds, &indices) {
@@ -103,6 +118,13 @@ unsafe extern "C" fn cf_init(info: ffi::duckdb_init_info) {
 
 /// `function` : tire un chunk du scan et le copie dans la sortie.
 unsafe extern "C" fn cf_func(info: ffi::duckdb_function_info, output: ffi::duckdb_data_chunk) {
+    guard(|| cf_func_body(info, output), |msg| {
+        let c = CString::new(msg).unwrap_or_default();
+        ffi::duckdb_function_set_error(info, c.as_ptr());
+    });
+}
+
+unsafe fn cf_func_body(info: ffi::duckdb_function_info, output: ffi::duckdb_data_chunk) {
     let scan = &*(ffi::duckdb_function_get_init_data(info) as *const QvdScan);
     match scan.pull() {
         Ok(Pull::Done) => ffi::duckdb_data_chunk_set_size(output, 0),
