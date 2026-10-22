@@ -121,8 +121,12 @@ impl WriteKind {
             WriteKind::F32 => Value::Float(*(data as *const f32).add(r) as f64),
             WriteKind::F64 => Value::Float(*(data as *const f64).add(r)),
             WriteKind::Date => {
+                // jours DuckDB → série Qlik (en double au-delà d'i32, ex. 'infinity')
                 let days = *(data as *const i32).add(r);
-                Value::Int(days + QLIK_EPOCH_OFFSET_DAYS as i32) // jours DuckDB → série Qlik
+                match days.checked_add(QLIK_EPOCH_OFFSET_DAYS as i32) {
+                    Some(serial) => Value::Int(serial),
+                    None => Value::Float(days as f64 + QLIK_EPOCH_OFFSET_DAYS),
+                }
             }
             WriteKind::Timestamp => {
                 let us = *(data as *const i64).add(r);
@@ -137,7 +141,7 @@ impl WriteKind {
                 // INTERVAL → durée en jours (mois approximés à 30 jours, le
                 // format QVD n'ayant pas de notion de mois).
                 let iv = *(data as *const ffi::duckdb_interval).add(r);
-                let days = (iv.months * 30 + iv.days) as f64;
+                let days = iv.months as f64 * 30.0 + iv.days as f64;
                 Value::Float(days + iv.micros as f64 / MICROS_PER_DAY)
             }
             WriteKind::Decimal { scale, phys } => {
@@ -243,6 +247,13 @@ unsafe fn read_custom_names(info: ffi::duckdb_copy_function_bind_info) -> Option
 
 /// `bind` : récupère le nombre, les types et (option) les noms des colonnes.
 unsafe extern "C" fn copy_bind(info: ffi::duckdb_copy_function_bind_info) {
+    guard(|| copy_bind_body(info), |msg| {
+        let c = CString::new(msg).unwrap_or_default();
+        ffi::duckdb_copy_function_bind_set_error(info, c.as_ptr());
+    });
+}
+
+unsafe fn copy_bind_body(info: ffi::duckdb_copy_function_bind_info) {
     let set_error = |msg: String| {
         let c = CString::new(msg).unwrap_or_default();
         ffi::duckdb_copy_function_bind_set_error(info, c.as_ptr());
@@ -286,6 +297,13 @@ unsafe extern "C" fn copy_bind(info: ffi::duckdb_copy_function_bind_info) {
 
 /// `global_init` : récupère le chemin de sortie et alloue les tampons.
 unsafe extern "C" fn copy_global_init(info: ffi::duckdb_copy_function_global_init_info) {
+    guard(|| copy_global_init_body(info), |msg| {
+        let c = CString::new(msg).unwrap_or_default();
+        ffi::duckdb_copy_function_global_init_set_error(info, c.as_ptr());
+    });
+}
+
+unsafe fn copy_global_init_body(info: ffi::duckdb_copy_function_global_init_info) {
     let bind = &*(ffi::duckdb_copy_function_global_init_get_bind_data(info) as *const CopyBindData);
     let path = CStr::from_ptr(ffi::duckdb_copy_function_global_init_get_file_path(info))
         .to_string_lossy()
@@ -309,6 +327,13 @@ unsafe extern "C" fn copy_sink(
     info: ffi::duckdb_copy_function_sink_info,
     chunk: ffi::duckdb_data_chunk,
 ) {
+    guard(|| copy_sink_body(info, chunk), |msg| {
+        let c = CString::new(msg).unwrap_or_default();
+        ffi::duckdb_copy_function_sink_set_error(info, c.as_ptr());
+    });
+}
+
+unsafe fn copy_sink_body(info: ffi::duckdb_copy_function_sink_info, chunk: ffi::duckdb_data_chunk) {
     let state = &*(ffi::duckdb_copy_function_sink_get_global_state(info) as *const CopyGlobalState);
     let n_rows = ffi::duckdb_data_chunk_get_size(chunk) as usize;
     let mut columns = state.columns.lock().unwrap();
@@ -326,6 +351,13 @@ unsafe extern "C" fn copy_sink(
 
 /// `finalize` : construit le QVD et l'écrit sur disque.
 unsafe extern "C" fn copy_finalize(info: ffi::duckdb_copy_function_finalize_info) {
+    guard(|| copy_finalize_body(info), |msg| {
+        let c = CString::new(msg).unwrap_or_default();
+        ffi::duckdb_copy_function_finalize_set_error(info, c.as_ptr());
+    });
+}
+
+unsafe fn copy_finalize_body(info: ffi::duckdb_copy_function_finalize_info) {
     let state =
         &*(ffi::duckdb_copy_function_finalize_get_global_state(info) as *const CopyGlobalState);
 
@@ -353,6 +385,19 @@ unsafe extern "C" fn copy_finalize(info: ffi::duckdb_copy_function_finalize_info
     if let Err(msg) = result {
         let c = CString::new(msg).unwrap_or_default();
         ffi::duckdb_copy_function_finalize_set_error(info, c.as_ptr());
+    }
+}
+
+/// Exécute un callback `extern "C"` en convertissant une panique en erreur DuckDB :
+/// une panique qui traverse la frontière C avorterait le processus hôte.
+pub(crate) fn guard(body: impl FnOnce(), set_error: impl FnOnce(String)) {
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        let msg = panic
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        set_error(format!("qvd : erreur interne ({msg})"));
     }
 }
 

@@ -51,8 +51,14 @@ on the `<Type>` element:
 
 Tags are a more reliable signal than `<Type>` (often `UNKNOWN` even for real
 dates). The Qlik serial number (epoch 1899-12-30) is converted to a native
-`DATE`/`TIMESTAMP`. Verified on real data: serial `33765` → `1992-06-10`.
+`DATE`/`TIMESTAMP`. Verified on real data: serial `33765` → `1992-06-10`. For
+`DATE`, the fractional part (time of day) is truncated, not rounded.
 `NULL`s are preserved.
+
+Headers are untrusted input: section sizes, symbol counts and bit positions are
+checked against the file size before anything is allocated, so a corrupt or
+crafted QVD fails with an error instead of exhausting memory or crashing the
+host process.
 
 ### Projection pushdown
 

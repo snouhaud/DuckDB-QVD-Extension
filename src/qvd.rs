@@ -41,6 +41,9 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 /// Nombre max de lignes décodées par chunk.
 const VECTOR_SIZE: usize = 2048;
 
+/// Taille maximale lue pour trouver la fin de l'en-tête XML.
+const MAX_HEADER_BYTES: u64 = 64 << 20;
+
 /// Représentation physique d'un `INTERVAL` DuckDB (`duckdb_interval`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -105,19 +108,51 @@ pub(crate) const MICROS_PER_DAY: f64 = 86_400_000_000.0;
 /// toucher aux tables de symboles ni à l'index. Renvoie le fichier (positionné de
 /// façon quelconque — toujours reseek en absolu ensuite), l'en-tête parsé, et
 /// `binary_start` = offset absolu du début de la section binaire.
+///
+/// L'en-tête n'est pas fiable (fichier quelconque) : ses tailles et offsets sont
+/// validés contre la taille réelle du fichier avant toute allocation qui en dépend.
 fn read_header(path: &str) -> Result<(File, QvdTableHeader, u64), Box<dyn Error>> {
     let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
     let mut xml = Vec::new();
     {
-        let mut br = BufReader::new(&mut file);
+        let mut br = BufReader::new(&mut file).take(MAX_HEADER_BYTES);
         br.read_until(0, &mut xml)?;
     }
-    let binary_start = xml.len() as u64;
-    if xml.last() == Some(&0) {
-        xml.pop();
+    if xml.last() != Some(&0) {
+        return Err(format!("'{path}' : en-tête QVD introuvable (pas de fin d'en-tête XML)").into());
     }
+    let binary_start = xml.len() as u64;
+    xml.pop();
     let header = qvdrs::header::parse_xml_header(&String::from_utf8(xml)?)?;
+    validate_header(&header, binary_start, file_len).map_err(|e| format!("'{path}' : {e}"))?;
     Ok((file, header, binary_start))
+}
+
+/// Vérifie que les sections décrites par l'en-tête tiennent dans le fichier :
+/// symboles `[binary_start, +offset)`, puis index `no_of_records × record_byte_size`,
+/// chaque table de symboles dans sa section, chaque champ dans un record. Rend
+/// sûres les allocations et l'arithmétique d'offsets qui suivent.
+fn validate_header(h: &QvdTableHeader, binary_start: u64, file_len: u64) -> Result<(), String> {
+    let index_len = (h.no_of_records as u64).checked_mul(h.record_byte_size as u64);
+    let end = index_len.and_then(|i| binary_start.checked_add(h.offset as u64)?.checked_add(i));
+    if end.is_none_or(|end| end > file_len) {
+        return Err("sections symboles/index plus grandes que le fichier".to_string());
+    }
+    let record_bits = h.record_byte_size * 8;
+    for f in &h.fields {
+        if f.offset.checked_add(f.length).is_none_or(|e| e > h.offset) {
+            return Err(format!("table de symboles de '{}' hors de la section des symboles", f.field_name));
+        }
+        // Un symbole occupe au moins un octet (son octet de type).
+        if f.no_of_symbols > f.length {
+            return Err(format!("champ '{}' : nombre de symboles incohérent", f.field_name));
+        }
+        if f.bit_width > 64 || f.bit_offset.checked_add(f.bit_width).is_none_or(|e| e > record_bits) {
+            return Err(format!("champ '{}' : position de bits hors du record", f.field_name));
+        }
+    }
+    Ok(())
 }
 
 /// Lit uniquement le schéma (en-tête) d'un QVD, sans décoder l'index ni les symboles.
@@ -265,15 +300,7 @@ impl QvdScan {
                     let syms = if let Some(sec) = &sym_section {
                         qvdrs::symbol::read_symbols(sec, f)
                     } else {
-                        // Plage lue directement dans le fichier : la borner à la
-                        // section des symboles (en-tête non fiable) avant d'allouer.
-                        if f.offset.checked_add(f.length).is_none_or(|end| end > header.offset) {
-                            return Err(format!(
-                                "table de symboles de '{}' hors de la section des symboles",
-                                f.field_name
-                            )
-                            .into());
-                        }
+                        // Plage bornée à la section des symboles par `validate_header`.
                         let mut sym_buf = vec![0u8; f.length];
                         file.seek(SeekFrom::Start(binary_start + f.offset as u64))?;
                         file.read_exact(&mut sym_buf)?;
@@ -285,12 +312,10 @@ impl QvdScan {
                         local.offset = 0;
                         qvdrs::symbol::read_symbols(&sym_buf, &local)
                     };
-                    syms.map(|v| {
-                        v.iter()
-                            .map(|x| convert(self.needed_kinds[j], &QvdValue::Symbol(x.clone())))
-                            .collect()
-                    })
-                    .unwrap_or_default()
+                    syms.map_err(|e| format!("table de symboles de '{}' : {e}", f.field_name))?
+                        .iter()
+                        .map(|x| convert(self.needed_kinds[j], &QvdValue::Symbol(x.clone())))
+                        .collect()
                 }
                 None => Vec::new(),
             };
@@ -418,7 +443,8 @@ fn kind_of_field(f: &QvdFieldHeader) -> Kind {
         "INTEGER" => Kind::Int,
         "REAL" | "FIX" | "MONEY" => Kind::Float,
         "DATE" => Kind::Date,
-        "TIME" | "TIMESTAMP" => Kind::Timestamp,
+        "TIME" => Kind::Time,
+        "TIMESTAMP" => Kind::Timestamp,
         _ => Kind::Text,
     }
 }
@@ -460,9 +486,10 @@ fn val_to_string(v: &QvdValue) -> Option<String> {
     }
 }
 
-/// Numéro de série Qlik → jours depuis l'époque DuckDB (pour `DATE`).
+/// Numéro de série Qlik → jours depuis l'époque DuckDB (pour `DATE`). Tronqué :
+/// la partie décimale est l'heure, elle ne doit pas faire changer de jour.
 fn serial_to_days(v: &QvdValue) -> Option<i32> {
-    val_to_f64(v).map(|s| (s - QLIK_EPOCH_OFFSET_DAYS).round() as i32)
+    val_to_f64(v).map(|s| (s - QLIK_EPOCH_OFFSET_DAYS).floor() as i32)
 }
 
 /// Numéro de série Qlik → microsecondes depuis l'époque DuckDB (pour `TIMESTAMP`).
@@ -760,30 +787,88 @@ mod tests {
         std::fs::write("/tmp/ti_sample.qvd", bytes).unwrap();
     }
 
-    /// Lecture par champ (projection étroite) : une table de symboles déclarée
-    /// hors de la section des symboles est une erreur, pas des octets de l'index
-    /// lus comme symboles.
+    /// En-tête non fiable : chaque valeur incohérente avec la taille du fichier est
+    /// refusée dès la lecture de l'en-tête, avant toute allocation qui en dépend.
     #[test]
-    fn symbol_table_outside_section_is_an_error() {
-        let big: Vec<Option<Value>> = (0..1000).map(|i| Some(Value::Str(format!("val{i:04}")))).collect();
-        let small: Vec<Option<Value>> = (0..1000).map(|i| Some(Value::Int(i % 2))).collect();
-        let path = write_temp("qvdrs_bounds_test.qvd", vec![tagged("a", big, &["$text"]), tagged("b", small, &["$integer"])]);
+    fn malformed_headers_are_rejected() {
+        let cases: &[(&[u8], &[u8], &str, &str)] = &[
+            // (champ ciblé ou "" pour la table, balise, valeur, message attendu)
+            (b"<FieldName>b</FieldName>", b"<Offset>", "SECTION_END", "hors de la section"),
+            (b"<FieldName>b</FieldName>", b"<NoOfSymbols>", "35184372088832", "nombre de symboles"),
+            (b"<FieldName>b</FieldName>", b"<BitWidth>", "1099511627776", "position de bits"),
+            (b"", b"<RecordByteSize>", "1099511627776", "plus grandes que le fichier"),
+            (b"", b"<NoOfRecords>", "18446744073709551615", "plus grandes que le fichier"),
+        ];
+        for (i, &(field, tag, value, expected)) in cases.iter().enumerate() {
+            let path = bounds_test_file(&format!("qvdrs_bad_header_{i}.qvd"));
+            let (_f, header, _bs) = read_header(&path).unwrap();
+            let value = if value == "SECTION_END" { header.offset.to_string() } else { value.to_string() };
+            set_tag(&path, field, tag, &value);
+            let err = read_schema(&path).err().unwrap_or_else(|| panic!("cas {i} accepté")).to_string();
+            assert!(err.contains(expected), "cas {i} : {err}");
+        }
+    }
 
-        // Déplace l'Offset du champ `b` à la fin de la section des symboles.
-        let (_f, header, _bs) = read_header(&path).unwrap();
+    /// Fichier sans fin d'en-tête XML : erreur, sans lire tout le fichier.
+    #[test]
+    fn missing_header_terminator_is_an_error() {
+        let path = std::env::temp_dir().join("qvdrs_no_header.qvd");
+        std::fs::write(&path, b"<QvdTableHeader>pas de NUL").unwrap();
+        let err = read_schema(path.to_str().unwrap()).err().unwrap().to_string();
+        assert!(err.contains("en-tête QVD introuvable"), "{err}");
+    }
+
+    /// Table de symboles illisible (texte tronqué) : erreur, pas une colonne NULL.
+    #[test]
+    fn corrupt_symbol_table_is_an_error() {
+        let path = bounds_test_file("qvdrs_bad_symbols.qvd");
+        let (_f, header, bs) = read_header(&path).unwrap();
+        let a = header.fields.iter().find(|f| f.field_name == "a").unwrap();
+        // Remplace le NUL final du premier symbole texte par un octet non-UTF-8.
         let mut bytes = std::fs::read(&path).unwrap();
-        let field_b = find(&bytes, b"<FieldName>b</FieldName>");
-        let start = field_b + find(&bytes[field_b..], b"<Offset>") + b"<Offset>".len();
-        let end = start + find(&bytes[start..], b"<");
-        bytes.splice(start..end, header.offset.to_string().into_bytes());
+        let first = bs as usize + a.offset;
+        let nul = first + find(&bytes[first..], b"\0");
+        bytes[nul - 1] = 0xFF;
         std::fs::write(&path, bytes).unwrap();
-
         let s = read_schema(&path).unwrap();
-        let res = QvdScan::new(std::slice::from_ref(&path), &s.names, &s.kinds, &[1]).and_then(|scan| {
+        let res = QvdScan::new(std::slice::from_ref(&path), &s.names, &s.kinds, &[0]).and_then(|scan| {
             while !matches!(scan.pull()?, Pull::Done) {}
             Ok(())
         });
-        assert!(res.unwrap_err().to_string().contains("hors de la section"));
+        assert!(res.unwrap_err().to_string().contains("table de symboles de 'a'"));
+    }
+
+    /// `$date` avec une heure (fraction) : jour tronqué, pas arrondi. Champ sans tag
+    /// au format TIME : colonne `TIME`, pas `TIMESTAMP`.
+    #[test]
+    fn date_is_truncated_and_untagged_time_is_time() {
+        let mut t = Column::new("t", vec![Some(Value::Float(0.75))]);
+        t.number_format.r#type = "TIME".to_string();
+        let cols = vec![tagged("d", vec![Some(Value::Float(45292.75))], &["$date"]), t];
+        let path = write_temp("qvdrs_date_time.qvd", cols);
+        let s = read_schema(&path).unwrap();
+        assert!(matches!(s.kinds[..], [Kind::Date, Kind::Time]));
+        let (c, _) = collect(&[path], &s.names, &s.kinds, &[0, 1]);
+        assert_eq!(c[0], TestCol::Date(vec![Some(19723)])); // 2024-01-01, pas le 02
+        assert_eq!(c[1], TestCol::Time(vec![Some(64_800_000_000)])); // 18:00
+    }
+
+    /// QVD de test à deux champs (`a` texte, `b` entier), 1000 lignes.
+    fn bounds_test_file(name: &str) -> String {
+        let big: Vec<Option<Value>> = (0..1000).map(|i| Some(Value::Str(format!("val{i:04}")))).collect();
+        let small: Vec<Option<Value>> = (0..1000).map(|i| Some(Value::Int(i % 2))).collect();
+        write_temp(name, vec![tagged("a", big, &["$text"]), tagged("b", small, &["$integer"])])
+    }
+
+    /// Remplace la valeur de la première balise `tag` qui suit `after` (début de
+    /// fichier si vide) dans l'en-tête XML.
+    fn set_tag(path: &str, after: &[u8], tag: &[u8], value: &str) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let from = if after.is_empty() { 0 } else { find(&bytes, after) };
+        let start = from + find(&bytes[from..], tag) + tag.len();
+        let end = start + find(&bytes[start..], b"<");
+        bytes.splice(start..end, value.bytes());
+        std::fs::write(path, bytes).unwrap();
     }
 
     fn find(hay: &[u8], needle: &[u8]) -> usize {
