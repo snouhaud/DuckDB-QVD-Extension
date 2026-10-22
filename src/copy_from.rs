@@ -1,217 +1,127 @@
 //! Lecture : `COPY table FROM 'fichier.qvd' (FORMAT qvd)`.
 //!
-//! Dans l'API C, le `COPY ... FROM` est délégué à une **table function**
-//! (attachée à la copy function via `duckdb_copy_function_set_copy_from_function`).
-//! duckdb-rs ne permet pas de récupérer le `duckdb_table_function` brut d'un
-//! `VTab` enregistré, donc on construit ici une table function en FFI brut qui
-//! réutilise le scan streaming de [`crate::qvd`] et écrit les chunks.
+//! Volet COPY FROM de la copy function `qvd` (C API v2). DuckDB fournit les
+//! colonnes de la **table cible** : les champs du QVD leur sont associés par
+//! position, lus via le scan streaming de [`crate::qvd`], puis écrits dans le
+//! type de la colonne cible (directement si le type correspond, sinon via un
+//! cast DuckDB).
 
-use std::ffi::{c_void, CStr, CString};
+use duckdb_neo::{
+    connection::{Context, FFILink},
+    copy_function::{CopyFromBindInfo, CopyFromCardinality, CopyFromFunctionCallbacks},
+    data_chunk::DataChunkRef,
+    logical_type::LogicalType,
+    value::{Value, ValueInput},
+    Error, Result,
+};
 
-use duckdb::ffi;
+use crate::copy::QvdFormat;
+use crate::qvd::{self, Cell, Kind, Pull, QvdScan};
+use crate::{err, logical_type, write_cells};
 
-use crate::qvd::{self, Cell, IntervalVal, Kind, Pull, QvdScan, Schema};
-
-struct CfBind {
+/// Données de bind : fichier, champs lus (les `n` premiers, `n` = nombre de
+/// colonnes cibles) et, pour chacun, le type cible quand il diffère du type lu.
+pub(crate) struct CopyFromBindData {
     path: String,
     names: Vec<String>,
     kinds: Vec<Kind>,
+    /// Type cible (texte SQL) quand un cast est nécessaire, `None` sinon.
+    casts: Vec<Option<String>>,
 }
 
-unsafe extern "C" fn destroy_bind(data: *mut c_void) {
-    drop(Box::from_raw(data as *mut CfBind));
-}
+impl CopyFromFunctionCallbacks for QvdFormat {
+    type BindData = CopyFromBindData;
+    type GlobalState = QvdScan;
+    type LocalState = ();
 
-unsafe extern "C" fn destroy_init(data: *mut c_void) {
-    drop(Box::from_raw(data as *mut QvdScan));
-}
-
-/// `bind` : lit le chemin (1er paramètre) et vérifie le schéma de la table cible.
-unsafe extern "C" fn cf_bind(info: ffi::duckdb_bind_info) {
-    match bind_inner(info) {
-        Ok(bind) => {
-            let ptr = Box::into_raw(Box::new(bind));
-            ffi::duckdb_bind_set_bind_data(info, ptr.cast(), Some(destroy_bind));
+    fn bind(
+        &self,
+        context: &Context,
+        file_path: &str,
+        info: &CopyFromBindInfo,
+    ) -> Result<(Self::BindData, Option<CopyFromCardinality>)> {
+        let schema = qvd::read_schema(file_path).map_err(err)?;
+        let n = info.column_count()?;
+        if schema.names.len() < n {
+            return Err(Error::invalid_input(format!(
+                "COPY FROM (FORMAT qvd) : le fichier a {} champs pour {n} colonnes cibles",
+                schema.names.len()
+            )));
         }
-        Err(msg) => {
-            let c = CString::new(msg).unwrap_or_default();
-            ffi::duckdb_bind_set_error(info, c.as_ptr());
+
+        let mut casts = Vec::with_capacity(n);
+        for (i, &kind) in schema.kinds.iter().take(n).enumerate() {
+            let (_, target) = info.get_column(i)?;
+            let same = target.id()? == logical_type(kind, context)?.id()?;
+            casts.push(if same { None } else { Some(target.to_text()?) });
         }
+
+        let bind = CopyFromBindData {
+            path: file_path.to_string(),
+            names: schema.names.into_iter().take(n).collect(),
+            kinds: schema.kinds.into_iter().take(n).collect(),
+            casts,
+        };
+        Ok((bind, None))
+    }
+
+    /// Scan streaming de tous les champs retenus. Un seul thread.
+    fn init_global_state(
+        &self,
+        bind: &Self::BindData,
+        _context: &Context,
+    ) -> Result<(Option<Self::GlobalState>, Option<std::num::NonZeroUsize>)> {
+        let indices: Vec<usize> = (0..bind.kinds.len()).collect();
+        let scan = QvdScan::new(std::slice::from_ref(&bind.path), &bind.names, &bind.kinds, &indices).map_err(err)?;
+        Ok((Some(scan), std::num::NonZeroUsize::new(1)))
+    }
+
+    /// Un lot vide signale la fin de la lecture.
+    fn exec(
+        &self,
+        bind: &Self::BindData,
+        scan: Option<&Self::GlobalState>,
+        _local: Option<&mut Self::LocalState>,
+        context: &Context,
+        mut output: DataChunkRef<'_>,
+    ) -> Result<()> {
+        let scan = scan.ok_or_else(|| Error::internal("COPY FROM qvd : état de scan absent"))?;
+        let Pull::Cells { columns } = scan.pull().map_err(err)? else {
+            return Ok(());
+        };
+        for (j, cells) in columns.iter().enumerate() {
+            let kind = bind.kinds[j];
+            match &bind.casts[j] {
+                None => write_cells(&mut output, j, kind, cells)?,
+                Some(target) => {
+                    let target = LogicalType::from_text(context, target)?;
+                    let [mut v] = output.get_vector_array_mut([j])?;
+                    v.set_size(cells.len())?;
+                    for (r, cell) in cells.iter().enumerate() {
+                        match cell_value(context, kind, cell)? {
+                            Some(value) => v.write_value_slow(r, value.cast(context, &target)?)?,
+                            None => v.set_null_slow(r)?,
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
-unsafe fn bind_inner(info: ffi::duckdb_bind_info) -> Result<CfBind, String> {
-    let mut pval = ffi::duckdb_bind_get_parameter(info, 0);
-    let pp = ffi::duckdb_get_varchar(pval);
-    let path = if pp.is_null() {
-        String::new()
-    } else {
-        let s = CStr::from_ptr(pp).to_string_lossy().into_owned();
-        ffi::duckdb_free(pp as *mut c_void);
-        s
+/// Valeur DuckDB d'une cellule (avant cast vers le type cible) ; `None` = NULL.
+fn cell_value(context: &Context, kind: Kind, cell: &Cell) -> Result<Option<Value>> {
+    let input = match (kind, cell) {
+        (_, Cell::Null) => return Ok(None),
+        (Kind::Int, Cell::I64(x)) => ValueInput::BigInt(*x),
+        (Kind::Timestamp, Cell::I64(x)) => ValueInput::Timestamp(*x),
+        (Kind::Time, Cell::I64(x)) => ValueInput::Time(*x),
+        (_, Cell::F64(x)) => ValueInput::Double(*x),
+        (_, Cell::Str(s)) => ValueInput::Varchar(s),
+        (_, Cell::I32(x)) => ValueInput::Date(*x),
+        (_, Cell::Interval(x)) => ValueInput::Interval { months: x.months, days: x.days, micros: x.micros },
+        (_, Cell::I64(x)) => ValueInput::BigInt(*x),
     };
-    ffi::duckdb_destroy_value(&mut pval);
-
-    let Schema { mut names, mut kinds, type_ids } =
-        qvd::read_schema(&path).map_err(|e| e.to_string())?;
-
-    // En COPY FROM, les colonnes de sortie sont celles de la table cible (on ne
-    // les déclare pas) : les champs du QVD leur sont associés par position. L'API
-    // C V1 ne sait pas convertir une valeur : un type différent est une erreur.
-    let n = ffi::duckdb_table_function_bind_get_result_column_count(info) as usize;
-    if names.len() < n {
-        return Err(format!(
-            "COPY FROM (FORMAT qvd) : le fichier a {} champs pour {n} colonnes cibles",
-            names.len()
-        ));
-    }
-    for (i, tid) in type_ids.into_iter().take(n).enumerate() {
-        let mut lt = ffi::duckdb_table_function_bind_get_result_column_type(info, i as u64);
-        let target = ffi::duckdb_get_type_id(lt);
-        ffi::duckdb_destroy_logical_type(&mut lt);
-        if target != tid as ffi::duckdb_type {
-            let col = CStr::from_ptr(ffi::duckdb_table_function_bind_get_result_column_name(info, i as u64))
-                .to_string_lossy();
-            return Err(format!(
-                "COPY FROM (FORMAT qvd) : la colonne '{col}' n'a pas le type du champ '{}' ({tid:?}) ; \
-                 utiliser INSERT INTO … SELECT … FROM read_qvd('{path}') pour convertir",
-                names[i]
-            ));
-        }
-    }
-    names.truncate(n);
-    kinds.truncate(n);
-
-    Ok(CfBind { path, names, kinds })
+    context.create_value(input).map(Some)
 }
-
-/// `init` : prépare le scan streaming (un seul fichier).
-unsafe extern "C" fn cf_init(info: ffi::duckdb_init_info) {
-    let bind = &*(ffi::duckdb_init_get_bind_data(info) as *const CfBind);
-    let indices: Vec<usize> = (0..bind.names.len()).collect();
-    match QvdScan::new(std::slice::from_ref(&bind.path), &bind.names, &bind.kinds, &indices) {
-        Ok(scan) => {
-            let ptr = Box::into_raw(Box::new(scan));
-            ffi::duckdb_init_set_init_data(info, ptr.cast(), Some(destroy_init));
-        }
-        Err(e) => {
-            let c = CString::new(e.to_string()).unwrap_or_default();
-            ffi::duckdb_init_set_error(info, c.as_ptr());
-        }
-    }
-}
-
-/// `function` : tire un chunk du scan et le copie dans la sortie.
-unsafe extern "C" fn cf_func(info: ffi::duckdb_function_info, output: ffi::duckdb_data_chunk) {
-    let scan = &*(ffi::duckdb_function_get_init_data(info) as *const QvdScan);
-    match scan.pull() {
-        Ok(Pull::Done) => ffi::duckdb_data_chunk_set_size(output, 0),
-        Ok(Pull::Rows(n)) => ffi::duckdb_data_chunk_set_size(output, n as u64),
-        Ok(Pull::Cells { columns }) => {
-            let kinds = scan.output_kinds();
-            let n = columns.first().map_or(0, |c| c.len());
-            for (j, &kind) in kinds.iter().enumerate() {
-                let vector = ffi::duckdb_data_chunk_get_vector(output, j as u64);
-                write_col_raw(vector, kind, &columns[j]);
-            }
-            ffi::duckdb_data_chunk_set_size(output, n as u64);
-        }
-        Err(e) => {
-            let c = CString::new(e.to_string()).unwrap_or_default();
-            ffi::duckdb_function_set_error(info, c.as_ptr());
-        }
-    }
-}
-
-/// Pose le bit NULL de la ligne `r` (alloue le masque de validité au besoin).
-unsafe fn set_null_raw(vector: ffi::duckdb_vector, r: usize) {
-    ffi::duckdb_vector_ensure_validity_writable(vector);
-    let validity = ffi::duckdb_vector_get_validity(vector);
-    ffi::duckdb_validity_set_row_invalid(validity, r as u64);
-}
-
-/// Écrit une colonne de `Cell` dans un vecteur DuckDB (FFI brut).
-unsafe fn write_col_raw(vector: ffi::duckdb_vector, kind: Kind, cells: &[Cell]) {
-    match kind {
-        Kind::Text => {
-            for (r, c) in cells.iter().enumerate() {
-                match c {
-                    Cell::Str(s) => ffi::duckdb_vector_assign_string_element_len(
-                        vector,
-                        r as u64,
-                        s.as_ptr() as *const std::os::raw::c_char,
-                        s.len() as u64,
-                    ),
-                    _ => set_null_raw(vector, r),
-                }
-            }
-        }
-        Kind::Int | Kind::Timestamp | Kind::Time => {
-            let data = ffi::duckdb_vector_get_data(vector) as *mut i64;
-            for (r, c) in cells.iter().enumerate() {
-                match c {
-                    Cell::I64(x) => *data.add(r) = *x,
-                    _ => {
-                        *data.add(r) = 0;
-                        set_null_raw(vector, r);
-                    }
-                }
-            }
-        }
-        Kind::Float => {
-            let data = ffi::duckdb_vector_get_data(vector) as *mut f64;
-            for (r, c) in cells.iter().enumerate() {
-                match c {
-                    Cell::F64(x) => *data.add(r) = *x,
-                    _ => {
-                        *data.add(r) = 0.0;
-                        set_null_raw(vector, r);
-                    }
-                }
-            }
-        }
-        Kind::Date => {
-            let data = ffi::duckdb_vector_get_data(vector) as *mut i32;
-            for (r, c) in cells.iter().enumerate() {
-                match c {
-                    Cell::I32(x) => *data.add(r) = *x,
-                    _ => {
-                        *data.add(r) = 0;
-                        set_null_raw(vector, r);
-                    }
-                }
-            }
-        }
-        Kind::Interval => {
-            let data = ffi::duckdb_vector_get_data(vector) as *mut IntervalVal;
-            for (r, c) in cells.iter().enumerate() {
-                match c {
-                    Cell::Interval(x) => *data.add(r) = *x,
-                    _ => {
-                        *data.add(r) = IntervalVal { months: 0, days: 0, micros: 0 };
-                        set_null_raw(vector, r);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Construit la table function de `COPY ... FROM` (à attacher à la copy function).
-pub(crate) unsafe fn build() -> ffi::duckdb_table_function {
-    let tf = ffi::duckdb_create_table_function();
-    let name = CString::new("qvd_copy_from").unwrap();
-    ffi::duckdb_table_function_set_name(tf, name.as_ptr());
-
-    let mut varchar = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
-    ffi::duckdb_table_function_add_parameter(tf, varchar);
-    ffi::duckdb_destroy_logical_type(&mut varchar);
-
-    ffi::duckdb_table_function_set_bind(tf, Some(cf_bind));
-    ffi::duckdb_table_function_set_init(tf, Some(cf_init));
-    ffi::duckdb_table_function_set_function(tf, Some(cf_func));
-    tf
-}
-
-// `IntervalVal` doit avoir la même disposition que `duckdb_interval`.
-const _: () = assert!(std::mem::size_of::<IntervalVal>() == 16);

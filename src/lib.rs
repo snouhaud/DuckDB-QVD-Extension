@@ -1,160 +1,178 @@
 //! Extension DuckDB `qvd` — expose la table function `read_qvd('fichier.qvd')`.
 //!
-//! `lib.rs` porte la plomberie DuckDB (enregistrement de la fonction, cycle
-//! bind/init/func). La lecture (streaming) et le typage du format QVD sont
-//! délégués à [`mod@qvd`] (crate `qvdrs`) ; l'écriture à [`mod@copy`] (OpenQVD).
+//! `lib.rs` porte la plomberie DuckDB (C API v2 via `duckdb-neo` : point
+//! d'entrée, table function). La lecture (streaming) et le typage du format QVD
+//! sont délégués à [`mod@qvd`] (crate `qvdrs`) ; l'écriture à [`mod@copy`]
+//! (OpenQVD).
 
 mod copy;
 mod copy_from;
 mod qvd;
 
-use duckdb::{
-    core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
-    ffi,
-    vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
-    Connection, Result,
+use std::fmt::Display;
+
+use duckdb_loadable_macros::duckdb_entrypoint_c_api_v2;
+use duckdb_neo::{
+    bind_arguments::BindArgument,
+    connection::Context,
+    copy_function::CopyFunctionBuilder,
+    data_chunk::DataChunkRef,
+    extension::Extension,
+    logical_type::LogicalType,
+    signature::{FunctionParameter, SignatureBuilder},
+    table_function::{
+        BindFunctionHandle, ExecColumnInfo, InitColumnData, TableFunctionBuilder,
+        TableFunctionCallbacks,
+    },
+    types::{DateValue, IntervalValue, TimeValue, TimestampValue},
+    vector::VectorElement,
+    DuckDBType, Error, Result,
 };
-use std::error::Error;
 
 use qvd::{Cell, Kind, Pull, QvdScan};
 
 /// Données produites par `bind` : la liste des fichiers (glob déployé) et le
 /// schéma complet (sans données). La lecture effective (streaming) n'a lieu
-/// qu'à l'`init`/`func`, en ne décodant que les colonnes projetées.
+/// qu'à l'`init`/`exec`, en ne décodant que les colonnes projetées.
 struct ReadQvdBindData {
     paths: Vec<String>,
     names: Vec<String>,
     kinds: Vec<Kind>,
 }
 
-struct ReadQvdVTab;
+struct ReadQvd;
 
-impl VTab for ReadQvdVTab {
-    type InitData = QvdScan;
+impl TableFunctionCallbacks for ReadQvd {
     type BindData = ReadQvdBindData;
-
-    /// Active la projection pushdown : DuckDB indiquera à l'`init` les seules
-    /// colonnes nécessaires.
-    fn supports_pushdown() -> bool {
-        true
-    }
+    type GlobalState = QvdScan;
+    type LocalState = ();
 
     /// Déploie le motif (glob), lit le schéma du premier fichier (en-tête seul)
     /// et déclare une colonne DuckDB par champ.
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        let pattern = bind.get_parameter(0).to_string();
-        let paths = expand_glob(&pattern)?;
+    fn bind(
+        &self,
+        context: &Context,
+        arguments: Vec<BindArgument>,
+        bind: BindFunctionHandle<'_>,
+    ) -> Result<Self::BindData> {
+        let pattern = arguments[0]
+            .value
+            .as_ref()
+            .and_then(|v| v.get::<String>().transpose())
+            .transpose()?
+            .ok_or_else(|| Error::invalid_input("read_qvd : chemin NULL"))?;
+        let paths = expand_glob(&pattern).map_err(err)?;
 
-        let schema = qvd::read_schema(&paths[0])?;
-        for (name, type_id) in schema.names.iter().zip(schema.type_ids.into_iter()) {
-            bind.add_result_column(name.as_str(), LogicalTypeHandle::from(type_id));
+        let schema = qvd::read_schema(&paths[0]).map_err(err)?;
+        for (name, &kind) in schema.names.iter().zip(&schema.kinds) {
+            bind.add_result_column(name, &logical_type(kind, context)?)?;
         }
 
         Ok(ReadQvdBindData { paths, names: schema.names, kinds: schema.kinds })
     }
 
-    /// Prépare le scan streaming (aucun décodage de l'index ici).
-    fn init(info: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
-        let bind = unsafe { &*info.get_bind_data::<ReadQvdBindData>() };
-        let indices: Vec<usize> =
-            info.get_column_indices().into_iter().map(|i| i as usize).collect();
-        QvdScan::new(&bind.paths, &bind.names, &bind.kinds, &indices)
+    /// Prépare le scan streaming sur les seules colonnes projetées (aucun
+    /// décodage de l'index ici). Un seul thread : le scan est séquentiel.
+    fn init_global_state(
+        &self,
+        bind: &Self::BindData,
+        _context: &Context,
+        columns: InitColumnData<'_>,
+    ) -> Result<(Option<Self::GlobalState>, Option<usize>)> {
+        let indices = (0..columns.count()?)
+            .map(|i| columns.get_column_index(i))
+            .collect::<Result<Vec<_>>>()?;
+        let scan = QvdScan::new(&bind.paths, &bind.names, &bind.kinds, &indices).map_err(err)?;
+        Ok((Some(scan), Some(1)))
     }
 
     /// Tire un chunk du scan streaming et le copie dans la sortie DuckDB.
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> Result<(), Box<dyn Error>> {
-        let scan = func.get_init_data();
-        match scan.pull()? {
-            Pull::Done => output.set_len(0),
-            Pull::Rows(n) => output.set_len(n), // COUNT(*) : lignes sans colonnes
+    /// Un chunk vide signale la fin.
+    fn exec(
+        &self,
+        _bind: &Self::BindData,
+        scan: Option<&Self::GlobalState>,
+        _local: Option<&mut Self::LocalState>,
+        _context: &Context,
+        mut output: DataChunkRef<'_>,
+        _columns: ExecColumnInfo<'_>,
+    ) -> Result<()> {
+        let scan = scan.ok_or_else(|| Error::internal("read_qvd : état de scan absent"))?;
+        match scan.pull().map_err(err)? {
+            Pull::Done => {}
+            // DuckDB demande toujours au moins une colonne (même pour COUNT(*)) :
+            // ce cas ne survient pas, mais reste géré par `QvdScan`.
+            Pull::Rows(_) => {}
             Pull::Cells { columns } => {
-                // Colonnes déjà converties par dictionnaire : copie directe.
-                let kinds = scan.output_kinds();
-                let n = columns.first().map_or(0, |c| c.len());
-                for (j, &kind) in kinds.iter().enumerate() {
-                    write_column(output, j, kind, &columns[j]);
+                for (j, &kind) in scan.output_kinds().iter().enumerate() {
+                    write_cells(&mut output, j, kind, &columns[j])?;
                 }
-                output.set_len(n);
             }
         }
         Ok(())
     }
+}
 
-    /// Paramètres positionnels : `read_qvd(VARCHAR)`.
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
+/// Type logique DuckDB d'une catégorie de colonne QVD.
+pub(crate) fn logical_type(kind: Kind, context: &Context) -> Result<LogicalType> {
+    match kind {
+        Kind::Int => i64::logical_type(context),
+        Kind::Float => f64::logical_type(context),
+        Kind::Text => String::logical_type(context),
+        Kind::Date => DateValue::logical_type(context),
+        Kind::Timestamp => TimestampValue::logical_type(context),
+        Kind::Time => TimeValue::logical_type(context),
+        Kind::Interval => IntervalValue::logical_type(context),
     }
 }
 
-/// Écrit une colonne de `Cell` (déjà convertis) dans le FlatVector `j`.
-/// Pour les types primitifs : écrit le slice puis pose les bits NULL.
-fn write_column(output: &mut DataChunkHandle, j: usize, kind: Kind, cells: &[Cell]) {
-    let mut v = output.flat_vector(j);
+/// Écrit une colonne de `Cell` (déjà convertis) dans le vecteur `j` de la
+/// sortie ; `Cell::Null` (ou une valeur d'un autre type) donne NULL.
+pub(crate) fn write_cells(output: &mut DataChunkRef<'_>, j: usize, kind: Kind, cells: &[Cell]) -> Result<()> {
     match kind {
         Kind::Text => {
+            let mut v = output.get_vector_at_mut::<String>(j)?;
+            v.set_size(cells.len())?;
+            let mut w = v.writer()?;
             for (r, c) in cells.iter().enumerate() {
-                match c {
-                    Cell::Str(s) => v.insert(r, s.as_str()),
-                    _ => v.set_null(r),
-                }
+                w.set(r, if let Cell::Str(s) = c { Some(s.as_str()) } else { None })?;
             }
+            Ok(())
         }
-        Kind::Int | Kind::Timestamp | Kind::Time => {
-            {
-                let s = unsafe { v.as_mut_slice::<i64>() };
-                for (r, c) in cells.iter().enumerate() {
-                    s[r] = if let Cell::I64(x) = c { *x } else { 0 };
-                }
-            }
-            set_nulls(&mut v, cells);
-        }
-        Kind::Float => {
-            {
-                let s = unsafe { v.as_mut_slice::<f64>() };
-                for (r, c) in cells.iter().enumerate() {
-                    s[r] = if let Cell::F64(x) = c { *x } else { 0.0 };
-                }
-            }
-            set_nulls(&mut v, cells);
-        }
-        Kind::Date => {
-            {
-                let s = unsafe { v.as_mut_slice::<i32>() };
-                for (r, c) in cells.iter().enumerate() {
-                    s[r] = if let Cell::I32(x) = c { *x } else { 0 };
-                }
-            }
-            set_nulls(&mut v, cells);
-        }
-        Kind::Interval => {
-            {
-                let s = unsafe { v.as_mut_slice::<qvd::IntervalVal>() };
-                for (r, c) in cells.iter().enumerate() {
-                    s[r] = match c {
-                        Cell::Interval(x) => *x,
-                        _ => qvd::IntervalVal { months: 0, days: 0, micros: 0 },
-                    };
-                }
-            }
-            set_nulls(&mut v, cells);
-        }
+        Kind::Int => write_typed::<i64>(output, j, cells, |c| if let Cell::I64(x) = c { Some(*x) } else { None }),
+        Kind::Float => write_typed::<f64>(output, j, cells, |c| if let Cell::F64(x) = c { Some(*x) } else { None }),
+        Kind::Date => write_typed::<DateValue>(output, j, cells, |c| if let Cell::I32(x) = c { Some(DateValue(*x)) } else { None }),
+        Kind::Timestamp => write_typed::<TimestampValue>(output, j, cells, |c| if let Cell::I64(x) = c { Some(TimestampValue(*x)) } else { None }),
+        Kind::Time => write_typed::<TimeValue>(output, j, cells, |c| if let Cell::I64(x) = c { Some(TimeValue(*x)) } else { None }),
+        Kind::Interval => write_typed::<IntervalValue>(output, j, cells, |c| match c {
+            Cell::Interval(x) => Some(IntervalValue { months: x.months, days: x.days, micros: x.micros }),
+            _ => None,
+        }),
     }
 }
 
-fn set_nulls(v: &mut duckdb::core::FlatVector, cells: &[Cell]) {
+fn write_typed<T>(output: &mut DataChunkRef<'_>, j: usize, cells: &[Cell], f: impl Fn(&Cell) -> Option<T>) -> Result<()>
+where
+    T: VectorElement + duckdb_neo::vector::WritableVectorElement,
+    for<'a> T: duckdb_neo::vector::WritableVectorElement<Write<'a> = T>,
+{
+    let mut v = output.get_vector_at_mut::<T>(j)?;
+    v.set_size(cells.len())?;
+    let mut w = v.writer()?;
     for (r, c) in cells.iter().enumerate() {
-        if matches!(c, Cell::Null) {
-            v.set_null(r);
-        }
+        w.set(r, f(c))?;
     }
+    Ok(())
+}
+
+/// Convertit une erreur quelconque (qvdrs, glob, OpenQVD…) en erreur DuckDB.
+pub(crate) fn err(e: impl Display) -> Error {
+    Error::invalid_input(e.to_string())
 }
 
 /// Déploie un motif glob en liste de fichiers triée. Un chemin littéral sans
 /// métacaractère se résout en lui-même (s'il existe). Erreur si aucun match.
-fn expand_glob(pattern: &str) -> Result<Vec<String>, Box<dyn Error>> {
+fn expand_glob(pattern: &str) -> std::result::Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut paths = Vec::new();
     for entry in glob::glob(pattern)? {
         paths.push(entry?.to_string_lossy().into_owned());
@@ -166,65 +184,18 @@ fn expand_glob(pattern: &str) -> Result<Vec<String>, Box<dyn Error>> {
     Ok(paths)
 }
 
-/// Enregistre la table function `read_qvd` et la copy function `qvd`.
-///
-/// On n'utilise pas la macro `duckdb_entrypoint_c_api` car la copy function
-/// (non wrappée par duckdb-rs) requiert le `duckdb_connection` brut, que la
-/// `Connection` de la macro n'expose pas. On reproduit donc sa logique :
-/// init de l'API C, récupération de la database, puis enregistrements.
-unsafe fn init_internal(
-    info: ffi::duckdb_extension_info,
-    access: *const ffi::duckdb_extension_access,
-) -> Result<bool, Box<dyn Error>> {
-    let version = option_env!("DUCKDB_EXTENSION_MIN_DUCKDB_VERSION").unwrap_or("dev");
-    if !ffi::duckdb_rs_extension_api_init(info, access, version)? {
-        return Ok(false); // incompatibilité de version d'API
-    }
+/// Point d'entrée (`qvd_init_c_api_v2`) : enregistre la table function
+/// `read_qvd` et la copy function `qvd` (COPY TO et COPY FROM).
+#[duckdb_entrypoint_c_api_v2(extension_name = "qvd", api_version = "v2.0.0")]
+fn entrypoint(extension: &Extension) -> Result<()> {
+    TableFunctionBuilder::new(
+        "read_qvd",
+        SignatureBuilder::new().param(FunctionParameter::new::<String>("path")),
+        ReadQvd,
+    )
+    .with_projection_pushdown(true)
+    .register(extension)?;
 
-    let get_database = (*access)
-        .get_database
-        .ok_or("get_database est null dans duckdb_extension_access")?;
-    let db_ptr = get_database(info);
-    if db_ptr.is_null() {
-        return Ok(false);
-    }
-    let database: ffi::duckdb_database = *db_ptr;
-
-    // Table function via l'API haut niveau de duckdb-rs.
-    let connection = Connection::open_from_raw(database.cast())?;
-    connection.register_table_function::<ReadQvdVTab>("read_qvd")?;
-
-    // Copy function via FFI brut, sur une connexion dédiée (l'enregistrement
-    // persiste au niveau de la base).
-    let mut con: ffi::duckdb_connection = std::ptr::null_mut();
-    if ffi::duckdb_connect(database, &mut con) != ffi::duckdb_state_DuckDBSuccess {
-        return Err("duckdb_connect a échoué".into());
-    }
-    let res = copy::register(con);
-    ffi::duckdb_disconnect(&mut con);
-    res?;
-
-    Ok(true)
-}
-
-/// Point d'entrée C appelé par DuckDB au chargement de l'extension.
-///
-/// # Safety
-/// Appelé par DuckDB avec des pointeurs valides.
-#[no_mangle]
-pub unsafe extern "C" fn qvd_init_c_api(
-    info: ffi::duckdb_extension_info,
-    access: *const ffi::duckdb_extension_access,
-) -> bool {
-    match init_internal(info, access) {
-        Ok(v) => v,
-        Err(e) => {
-            if let Some(set_error) = (*access).set_error {
-                if let Ok(c) = std::ffi::CString::new(e.to_string()) {
-                    set_error(info, c.as_ptr());
-                }
-            }
-            false
-        }
-    }
+    CopyFunctionBuilder::new("qvd", copy::QvdFormat).register_to_and_from(extension)?;
+    Ok(())
 }

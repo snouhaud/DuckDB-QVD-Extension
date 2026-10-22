@@ -32,7 +32,6 @@
 use std::error::Error;
 use std::sync::Mutex;
 
-use duckdb::core::LogicalTypeId;
 use qvdrs::header::{QvdFieldHeader, QvdTableHeader};
 use qvdrs::{QvdSymbol, QvdValue};
 use std::fs::File;
@@ -50,16 +49,15 @@ pub(crate) struct IntervalVal {
     pub micros: i64,
 }
 
-/// Schéma d'un QVD : noms, catégories et types DuckDB de toutes les colonnes.
+/// Schéma d'un QVD : noms et catégories de toutes les colonnes.
 /// Lu au `bind` sans décoder les données.
 pub(crate) struct Schema {
     pub names: Vec<String>,
     pub kinds: Vec<Kind>,
-    pub type_ids: Vec<LogicalTypeId>,
 }
 
 /// Catégorie de colonne, déduite des tags Qlik.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Kind {
     Int,
     Float,
@@ -68,20 +66,6 @@ pub(crate) enum Kind {
     Timestamp,
     Time,
     Interval,
-}
-
-impl Kind {
-    fn type_id(self) -> LogicalTypeId {
-        match self {
-            Kind::Int => LogicalTypeId::Bigint,
-            Kind::Float => LogicalTypeId::Double,
-            Kind::Text => LogicalTypeId::Varchar,
-            Kind::Date => LogicalTypeId::Date,
-            Kind::Timestamp => LogicalTypeId::Timestamp,
-            Kind::Time => LogicalTypeId::Time,
-            Kind::Interval => LogicalTypeId::Interval,
-        }
-    }
 }
 
 /// Valeur convertie, prête à écrire dans un vecteur DuckDB. Mutualise la logique
@@ -125,14 +109,12 @@ pub(crate) fn read_schema(path: &str) -> Result<Schema, Box<dyn Error>> {
     let (_file, header, _bs) = read_header(path)?;
     let mut names = Vec::new();
     let mut kinds = Vec::new();
-    let mut type_ids = Vec::new();
     for f in &header.fields {
         let kind = kind_of_field(f);
         names.push(f.field_name.clone());
-        type_ids.push(kind.type_id());
         kinds.push(kind);
     }
-    Ok(Schema { names, kinds, type_ids })
+    Ok(Schema { names, kinds })
 }
 
 /// État mutable d'un scan (un fichier ouvert à la fois pour le glob).
@@ -598,11 +580,11 @@ mod tests {
     }
 
     /// Lit schéma + toutes les colonnes (projection = tous les champs).
-    fn read_all(path: &str) -> (Vec<String>, Vec<LogicalTypeId>, Vec<TestCol>, usize) {
+    fn read_all(path: &str) -> (Vec<String>, Vec<Kind>, Vec<TestCol>, usize) {
         let s = read_schema(path).unwrap();
         let indices: Vec<usize> = (0..s.names.len()).collect();
         let (cols, n) = collect(&[path.to_string()], &s.names, &s.kinds, &indices);
-        (s.names, s.type_ids, cols, n)
+        (s.names, s.kinds, cols, n)
     }
 
     #[test]
@@ -628,15 +610,15 @@ mod tests {
             ),
         ];
         let path = write_temp("qvdrs_read_test.qvd", cols);
-        let (names, type_ids, columns, num_rows) = read_all(&path);
+        let (names, kinds, columns, num_rows) = read_all(&path);
 
         assert_eq!(num_rows, 3);
         assert_eq!(names, ["id", "price", "name", "qty", "day"]);
-        assert!(matches!(type_ids[0], LogicalTypeId::Bigint));
-        assert!(matches!(type_ids[1], LogicalTypeId::Double));
-        assert!(matches!(type_ids[2], LogicalTypeId::Varchar));
-        assert!(matches!(type_ids[3], LogicalTypeId::Bigint));
-        assert!(matches!(type_ids[4], LogicalTypeId::Date));
+        assert_eq!(kinds[0], Kind::Int);
+        assert_eq!(kinds[1], Kind::Float);
+        assert_eq!(kinds[2], Kind::Text);
+        assert_eq!(kinds[3], Kind::Int);
+        assert_eq!(kinds[4], Kind::Date);
 
         match &columns[0] {
             TestCol::I64(v) => assert_eq!(v, &[Some(1), Some(2), Some(3)]),
@@ -726,10 +708,10 @@ mod tests {
             tagged("dur", vec![Some(Value::Float(1.5)), Some(Value::Float(2.0))], &["$interval"]),
         ];
         let path = write_temp("qvdrs_time_interval.qvd", cols);
-        let (_, type_ids, columns, _) = read_all(&path);
+        let (_, kinds, columns, _) = read_all(&path);
 
-        assert!(matches!(type_ids[0], LogicalTypeId::Time));
-        assert!(matches!(type_ids[1], LogicalTypeId::Interval));
+        assert_eq!(kinds[0], Kind::Time);
+        assert_eq!(kinds[1], Kind::Interval);
 
         match &columns[0] {
             TestCol::Time(v) => assert_eq!(v, &[Some(12 * 3_600_000_000), Some(6 * 3_600_000_000)]),
@@ -800,9 +782,9 @@ mod tests {
                 continue;
             }
             let p = path.to_str().unwrap();
-            let (names, type_ids, _cols, num_rows) = read_all(p);
+            let (names, kinds, _cols, num_rows) = read_all(p);
             println!("\n===== {p} ({num_rows} lignes) =====");
-            for (n, t) in names.iter().zip(&type_ids) {
+            for (n, t) in names.iter().zip(&kinds) {
                 println!("  {n}: {t:?}");
             }
         }
