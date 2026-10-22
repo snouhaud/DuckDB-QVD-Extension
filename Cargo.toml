@@ -1,8 +1,8 @@
 [package]
 name = "qvd_next"
-version = "1.0.6"
+version = "0.1.0"
 edition = "2021"
-description = "Extension DuckDB pour lire les fichiers Qlik QVD via OpenQVD"
+description = "Extension DuckDB pour lire (qvdrs) et écrire (OpenQVD) les fichiers Qlik QVD"
 license = "Apache-2.0"
 
 [lib]
@@ -27,7 +27,7 @@ crate-type = ["staticlib"]
 duckdb-neo = { version = "=0.20000.0", features = ["build-extension"] }
 duckdb-loadable-macros = { version = "=1.20000.0", features = ["neo"] }
 
-# Lecture QVD : reader streaming à mémoire bornée (open_qvd_stream/next_chunk).
+# Lecture QVD : primitives bas niveau (en-tête, symboles, index) du crate qvdrs.
 # Renommé pour éviter la collision avec le nom de package "qvd" ci-dessus.
 qvdrs = { package = "qvd", version = "0.7" }
 

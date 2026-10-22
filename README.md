@@ -68,15 +68,22 @@ on the `<Type>` element:
 
 Tags are a more reliable signal than `<Type>` (often `UNKNOWN` even for real
 dates). The Qlik serial number (epoch 1899-12-30) is converted to a native
-`DATE`/`TIMESTAMP`. Verified on real data: serial `33765` → `1992-06-10`.
+`DATE`/`TIMESTAMP`. Verified on real data: serial `33765` → `1992-06-10`. For
+`DATE`, the fractional part (time of day) is truncated, not rounded.
 `NULL`s are preserved.
+
+Headers are untrusted input: section sizes, symbol counts and bit positions are
+checked against the file size before anything is allocated, so a corrupt or
+crafted QVD fails with an error instead of exhausting memory or crashing the
+host process.
 
 ### Projection pushdown
 
 `supports_pushdown()` is enabled: DuckDB only requests the useful columns, and
-only those are decoded via `Qvd::from_path_projected`. The `bind` reads only the
-header; data decoding happens at `init`, restricted to the projected columns.
-`SELECT count(*)` decodes no column.
+only those are read and decoded. The `bind` reads only the header; data decoding
+happens at scan time, restricted to the projected columns. `SELECT count(*)`
+decodes a single column: DuckDB always requests at least one from a table
+function.
 
 ### Multi-file glob
 
@@ -126,7 +133,8 @@ Implemented as a **copy function** of the C API v2 ([`src/copy.rs`](src/copy.rs)
 `bind` (names, types) → `init` (path) → `batch`/`flush` (accumulation) →
 `finalize` (OpenQVD encoding, written through DuckDB's file system).
 Types are preserved and tagged for reading back (`BIGINT`/`DOUBLE`/`VARCHAR`/
-`DATE`/`TIMESTAMP`), `NULL` and UTF-8 are kept. Verified in a round-trip
+`DATE`/`TIMESTAMP`/`TIME`/`INTERVAL`; `DECIMAL` becomes `DOUBLE`), `NULL` and
+UTF-8 are kept. Verified in a round-trip
 `read_qvd` → `COPY` → `read_qvd`.
 
 **Column names.** Fields take the query's column names. They can be overridden
@@ -168,11 +176,11 @@ target column types when they differ from the types `read_qvd` infers.
 - Typing driven by Qlik tags; a QVD without tags falls back to `<Type>` and then
   `VARCHAR` by default (files produced by Qlik are always tagged).
 - **Streaming projected read with bounded memory** (≈ projected symbol tables +
-  one chunk of index bytes). Only the **projected** columns' symbols are decoded
-  and only the projected fields' bits are extracted per record — work scales with
-  the projection, not the total column count. The index block's **bytes** are still
-  read in full (fields are bit-interleaved in each record — a QVD format trait), but
-  warm that is cheap; the former bottleneck was extracting all columns' bits.
+  one chunk of index bytes). Only the **projected** columns' symbol tables are read
+  and decoded, and only the projected fields' bits are extracted per record — work
+  scales with the projection, not the total column count. The index block's
+  **bytes** are still read in full (fields are bit-interleaved in each record — a
+  QVD format trait).
 - **Writing** (`COPY TO`) still accumulates all rows in memory (OpenQVD writer).
 
 ## Important limitations and behaviour notes
@@ -232,19 +240,24 @@ extracts only the projected fields' bits per record; the previous reader decoded
 bounded memory (~29–37 MB), and no regression on full-table reads. The former
 bottleneck was decoding all 49 columns' bit-fields per row (≈ 490 M extractions
 for 10 M rows) even for a single-column query; the projected reader extracts only
-what is asked for. Symbol-table decoding turned out to be negligible (~0.01 s);
-`count(*)` is now served almost entirely from the header.
+what is asked for. Symbol-table decoding turned out to be negligible (~0.01 s).
+These figures predate reading only the projected symbol tables (#6), which
+further cuts I/O and memory on wide files.
 
 ## Structure
 
-| File | Role |
-|---|---|
-| `src/lib.rs` | C-API entrypoint + `read_qvd` VTab (DuckDB plumbing, streaming) |
-| `src/qvd.rs` | `qvdrs` streaming projected read: header/typing, projected symbol + index decode, conversions + tests |
-| `src/wasm_lib.rs` | Re-export for the Wasm target (staticlib) |
-| `Cargo.toml` | Dependencies (`duckdb`, + `openqvd`/`arrow` to enable) |
-| `Makefile` | C-API build (`make debug`/`release`) + fast cargo targets |
-| `test/sql/read_qvd.test` | SQLLogicTest smoke test |
+| File                           | Role                                                                                            |
+| ------------------------------ | ----------------------------------------------------------------------------------------------- |
+| `src/lib.rs`                   | C-API entrypoint + `read_qvd` VTab (DuckDB plumbing, streaming)                                 |
+| `src/qvd.rs`                   | QVD format: header validation/typing, projected symbol + index decode, conversions + unit tests |
+| `src/copy.rs`                  | `COPY ... TO (FORMAT qvd)`: copy function (raw FFI), OpenQVD writer                             |
+| `src/copy_from.rs`             | `COPY ... FROM (FORMAT qvd)`: copy-from table function (raw FFI)                                |
+| `src/wasm_lib.rs`              | Re-export for the Wasm target (staticlib)                                                       |
+| `Cargo.toml`                   | Dependencies (`duckdb`, `qvd`/qvdrs, `openqvd`, `glob`)                                         |
+| `Makefile`                     | C-API build (`make debug`/`release`) + fast cargo targets                                       |
+| `test/sql/*.test`              | SQLLogicTest suites (`read_qvd`, `COPY TO/FROM`)                                                |
+| `docs/stable-abi-migration.md` | Why the extension uses the stable C ABI                                                         |
+| `scripts/build-extension.sh`   | Standalone build without the Makefile/venv                                                      |
 
 ## Build
 
@@ -253,9 +266,6 @@ what is asked for. Symbol-table decoding turned out to be negligible (~0.01 s);
 ```sh
 make cargo-build        # or: cargo build
 ```
-
-> Building the `loadable-extension` feature of the `duckdb` crate generates
-> bindings and may require **libclang** (bindgen) installed on the machine.
 
 ### Loadable extension (`.duckdb_extension`)
 
@@ -286,8 +296,8 @@ duckdb -unsigned -c "LOAD 'build/debug/qvd.duckdb_extension'; \
 ```
 
 > A standalone script `./scripts/build-extension.sh` also produces a
-> `build/qvd.duckdb_extension` without a venv (it stamps against the locally
-> installed `duckdb` version), handy for quick local checks.
+> `build/qvd.duckdb_extension` (debug, stable ABI, V1 C API v1.5.6) without the
+> Makefile/venv, handy for quick local checks.
 
 ## Tests
 
@@ -309,7 +319,7 @@ To test on real QVDs: drop files into `test/data/` and adapt
 
 - [x] Reading `read_qvd('file.qvd')` with BIGINT/DOUBLE/VARCHAR typing + NULL.
 - [x] Native temporal types `DATE`/`TIMESTAMP`/`TIME`/`INTERVAL` (Qlik serials converted).
-- [x] Projection pushdown via `from_path_projected` (only useful columns decoded).
+- [x] Projection pushdown (only the projected columns' symbols and bits are read).
 - [x] Glob `read_qvd('data/*.qvd')` (concatenated rows, resolution by name).
 - [x] Writing `COPY ... TO ... (FORMAT qvd)` (FFI copy function; round-trip verified).
 - [x] Preserve column names on write (query names, `FIELD_NAMES` override).

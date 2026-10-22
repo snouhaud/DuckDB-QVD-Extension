@@ -69,3 +69,14 @@ SELECT * FROM mismatch ORDER BY i NULLS LAST;
 ----
 1.0	1.5
 NULL	NULL
+
+# Values beyond i32 in the Qlik conversion (infinite date, huge interval) are
+# written without overflow.
+statement ok
+COPY (SELECT 'infinity'::DATE AS d, INTERVAL (100000000) MONTH AS iv)
+TO '__WORKING_DIRECTORY__/build/overflow.qvd' (FORMAT qvd, FIELD_NAMES (d, iv));
+
+query T
+SELECT d FROM read_qvd('__WORKING_DIRECTORY__/build/overflow.qvd');
+----
+infinity

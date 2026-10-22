@@ -119,8 +119,11 @@ impl WriteKind {
             }),
             WriteKind::F32 => push::<f32>(chunk, j, out, |v| Value::Float(*v as f64)),
             WriteKind::F64 => push::<f64>(chunk, j, out, |v| Value::Float(*v)),
-            // jours DuckDB → série Qlik
-            WriteKind::Date => push::<DateValue>(chunk, j, out, |v| Value::Int(v.0 + QLIK_EPOCH_OFFSET_DAYS as i32)),
+            // jours DuckDB → série Qlik (en double au-delà d'i32, ex. 'infinity')
+            WriteKind::Date => push::<DateValue>(chunk, j, out, |v| match v.0.checked_add(QLIK_EPOCH_OFFSET_DAYS as i32) {
+                Some(serial) => Value::Int(serial),
+                None => Value::Float(v.0 as f64 + QLIK_EPOCH_OFFSET_DAYS),
+            }),
             WriteKind::Timestamp => push::<TimestampValue>(chunk, j, out, |v| {
                 Value::Float(v.0 as f64 / MICROS_PER_DAY + QLIK_EPOCH_OFFSET_DAYS)
             }),
@@ -129,7 +132,7 @@ impl WriteKind {
             // INTERVAL → durée en jours (mois approximés à 30 jours, le format
             // QVD n'ayant pas de notion de mois).
             WriteKind::Interval => push::<IntervalValue>(chunk, j, out, |v| {
-                Value::Float((v.months * 30 + v.days) as f64 + v.micros as f64 / MICROS_PER_DAY)
+                Value::Float(v.months as f64 * 30.0 + v.days as f64 + v.micros as f64 / MICROS_PER_DAY)
             }),
             WriteKind::Decimal { scale, phys } => {
                 let div = 10f64.powi(scale as i32);
@@ -203,7 +206,7 @@ impl CopyToFunctionCallbacks for QvdFormat {
             let kind = WriteKind::of_logical_type(&lt)?.ok_or_else(|| {
                 Error::invalid_input(format!(
                     "COPY (FORMAT qvd) : type de colonne non supporté ({}) en écriture ; \
-                     CAST vers BIGINT/DOUBLE/VARCHAR/DATE/TIMESTAMP",
+                     CAST vers BIGINT/DOUBLE/DECIMAL/VARCHAR/DATE/TIMESTAMP/TIME/INTERVAL/BOOLEAN",
                     lt.to_text().unwrap_or_default()
                 ))
             })?;
