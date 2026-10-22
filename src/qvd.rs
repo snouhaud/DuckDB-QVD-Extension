@@ -2,12 +2,14 @@
 //!
 //! Le QVD est un format colonne dictionnaire-encodé : chaque colonne a une table
 //! de **symboles** (valeurs distinctes) et un bloc d'**index** vers ces symboles.
-//! On ouvre le fichier en flux (`open_qvd_stream`) — les tables de symboles sont
-//! décodées une fois, l'index est lu par chunks (`next_chunk_indices`, ~2048
-//! lignes). Chaque symbole projeté n'est **converti qu'une seule fois** par fichier
-//! (le dictionnaire de `Cell`) ; les lignes sont ensuite émises par simple lookup
-//! d'index. Mémoire bornée (≈ tables de symboles + un chunk d'index), et on évite
-//! de reconvertir chaque ligne (gain net sur colonnes à faible cardinalité).
+//! À l'ouverture d'un fichier, seul l'en-tête XML est lu (`read_header`, validé
+//! contre la taille du fichier), puis les tables de symboles des seules colonnes
+//! **projetées** (`qvdrs::symbol::read_symbols`). Chaque symbole projeté n'est
+//! **converti qu'une seule fois** par fichier (le dictionnaire de `Cell`). L'index
+//! est ensuite lu par chunks de 2048 lignes, dont on n'extrait que les bits des
+//! champs projetés (`qvdrs::index::read_field_index`) ; les lignes sont émises par
+//! simple lookup. Mémoire bornée (≈ tables de symboles projetées + un chunk
+//! d'index).
 //!
 //! # Correspondance des types
 //!

@@ -9,8 +9,9 @@
 //! # Limitation connue
 //!
 //! L'API C de la copy function n'expose **pas les noms de colonnes** : les
-//! champs sont nommés `field0`, `field1`, … Les types, eux, sont préservés
-//! (entiers, flottants, texte, `DATE`, `TIMESTAMP`) et taggés pour que
+//! champs sont nommés `field0`, `field1`, … (option `FIELD_NAMES` pour les
+//! fixer). Les types, eux, sont préservés (entiers, flottants, texte, `DATE`,
+//! `TIMESTAMP`, `TIME`, `INTERVAL` ; `DECIMAL` → double) et taggés pour que
 //! [`crate::qvd`] les relise correctement.
 
 use std::ffi::{c_void, CStr, CString};
@@ -271,7 +272,7 @@ unsafe fn copy_bind_body(info: ffi::duckdb_copy_function_bind_info) {
             None => {
                 set_error(format!(
                     "COPY (FORMAT qvd) : type de colonne non supporté (id {tid}) en écriture ; \
-                     CAST vers BIGINT/DOUBLE/VARCHAR/DATE/TIMESTAMP"
+                     CAST vers BIGINT/DOUBLE/DECIMAL/VARCHAR/DATE/TIMESTAMP/TIME/INTERVAL/BOOLEAN"
                 ));
                 return;
             }
