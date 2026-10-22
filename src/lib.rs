@@ -19,7 +19,7 @@ use duckdb_neo::{
     data_chunk::DataChunkRef,
     extension::Extension,
     logical_type::LogicalType,
-    signature::{FunctionParameter, SignatureBuilder},
+    signature::{FunctionDocumentationBuilder, FunctionParameter, SignatureBuilder},
     table_function::{
         BindFunctionHandle, ExecColumnInfo, InitColumnData, TableFunctionBuilder,
         TableFunctionCallbacks,
@@ -190,7 +190,19 @@ fn expand_glob(pattern: &str) -> std::result::Result<Vec<String>, Box<dyn std::e
 fn entrypoint(extension: &Extension) -> Result<()> {
     TableFunctionBuilder::new(
         "read_qvd",
-        SignatureBuilder::new().param(FunctionParameter::new::<String>("path")),
+        SignatureBuilder::new()
+            .param(FunctionParameter::new::<String>("path"))
+            .documentation(
+                FunctionDocumentationBuilder::new()
+                    .description(
+                        "Reads a Qlik QVD file (or a glob of files, concatenated by field name) as a table, \
+                         typing columns from the Qlik tags and decoding only the projected columns.",
+                    )
+                    .add_example("", "SELECT * FROM read_qvd('sales.qvd');")
+                    .add_example("", "SELECT count(*) FROM read_qvd('data/*.qvd');")
+                    .add_category("io")
+                    .add_category("qlik"),
+            ),
         ReadQvd,
     )
     .with_projection_pushdown(true)

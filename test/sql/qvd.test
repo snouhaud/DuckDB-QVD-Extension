@@ -29,3 +29,10 @@ LIMIT 1;
 statement error
 SELECT * FROM read_qvd('QVD-Examples/__nonexistent__.qvd');
 ----
+
+# Discoverability (duckdb_functions): real parameter name, description, examples.
+query TTII
+SELECT function_type, parameters::VARCHAR, description IS NOT NULL, len(examples)
+FROM duckdb_functions() WHERE function_name = 'read_qvd';
+----
+table	[path]	true	2
