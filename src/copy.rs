@@ -106,6 +106,17 @@ impl WriteKind {
         t.iter().map(|s| s.to_string()).collect()
     }
 
+    /// `<NumberFormat>` (type, masque) des séries temporelles : sans lui, Qlik
+    /// affiche le numéro de série (ex. 39322) au lieu d'une date.
+    fn number_format(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            WriteKind::Date => Some(("DATE", "YYYY-MM-DD")),
+            WriteKind::Timestamp => Some(("TIMESTAMP", "YYYY-MM-DD hh:mm:ss")),
+            WriteKind::Time => Some(("TIME", "hh:mm:ss")),
+            _ => None,
+        }
+    }
+
     /// Lit la colonne `j` du chunk et ajoute ses valeurs converties à `out`.
     fn read(self, chunk: &DataChunkRef<'_>, j: usize, out: &mut Vec<Option<Value>>) -> Result<()> {
         match self {
@@ -278,20 +289,61 @@ impl CopyToFunctionCallbacks for QvdFormat {
             .map(|((name, kind), vals)| {
                 let mut col = Column::new(name.clone(), vals);
                 col.tags = kind.tags();
+                if let Some((t, f)) = kind.number_format() {
+                    col.number_format.r#type = t.to_string();
+                    col.number_format.fmt = f.to_string();
+                }
                 col
             })
             .collect();
-        let bytes = WriteTable::new("qvd", cols).map_err(err)?.to_bytes().map_err(err)?;
+        let table = std::path::Path::new(&state.path).file_stem().and_then(|s| s.to_str()).unwrap_or("qvd");
+        let bytes = WriteTable::new(table, cols).map_err(err)?.to_bytes().map_err(err)?;
+        let at = build_no_at(&bytes)?;
 
         let fs = FileSystem::new(context)?;
         let file = FileBuilder::new(&fs, &state.path)?.write().create_new().open()?;
-        let mut rest = &bytes[..];
-        while !rest.is_empty() {
-            match file.write(rest)? {
-                0 => return Err(Error::invalid_input(format!("écriture interrompue : {}", state.path))),
-                n => rest = &rest[n..],
+        for mut rest in [&bytes[..at], BUILD_NO, &bytes[at..]] {
+            while !rest.is_empty() {
+                match file.write(rest)? {
+                    0 => return Err(Error::invalid_input(format!("écriture interrompue : {}", state.path))),
+                    n => rest = &rest[n..],
+                }
             }
         }
         file.close()
+    }
+}
+
+/// Qlik Sense charge **0 ligne, sans erreur**, d'un QVD dont l'en-tête n'a pas de
+/// `<QvBuildNo>` (OpenQVD n'en écrit pas ; vérifié sur Qlik Sense client-managed).
+/// Les offsets du corps sont relatifs à la fin de l'en-tête : l'insertion ne décale rien.
+const BUILD_NO: &[u8] = b"  <QvBuildNo>50699</QvBuildNo>\r\n";
+
+/// Position d'insertion de [`BUILD_NO`] : juste après `<QvdTableHeader>`.
+fn build_no_at(bytes: &[u8]) -> Result<usize> {
+    const OPEN: &[u8] = b"<QvdTableHeader>\r\n";
+    bytes
+        .windows(OPEN.len())
+        .position(|w| w == OPEN)
+        .map(|i| i + OPEN.len())
+        .ok_or_else(|| Error::invalid_input("en-tête QVD inattendu (OpenQVD)".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn en_tete_lisible_par_qlik() {
+        let mut col = Column::new("d", vec![Some(Value::Int(45000)), None]);
+        col.number_format.r#type = "DATE".to_string();
+        let bytes = WriteTable::new("t", vec![col]).unwrap().to_bytes().unwrap();
+        let at = build_no_at(&bytes).unwrap();
+        let fixed = [&bytes[..at], BUILD_NO, &bytes[at..]].concat();
+        let q = openqvd::Qvd::from_bytes(fixed).unwrap();
+        assert_eq!(q.header().build_no.as_deref(), Some("50699"));
+        assert_eq!((q.table_name(), q.num_rows()), ("t", 2));
+        assert_eq!(q.fields()[0].number_format_type(), "DATE");
+        assert_eq!(q.rows().count(), 2);
     }
 }
