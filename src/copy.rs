@@ -104,6 +104,17 @@ impl WriteKind {
         t.iter().map(|s| s.to_string()).collect()
     }
 
+    /// `<NumberFormat>` (type, masque) des séries temporelles : sans lui, Qlik
+    /// affiche le numéro de série (ex. 39322) au lieu d'une date.
+    fn number_format(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            WriteKind::Date => Some(("DATE", "YYYY-MM-DD")),
+            WriteKind::Timestamp => Some(("TIMESTAMP", "YYYY-MM-DD hh:mm:ss")),
+            WriteKind::Time => Some(("TIME", "hh:mm:ss")),
+            _ => None,
+        }
+    }
+
     /// Lit la valeur de la ligne `r` dans le tampon `data` du vecteur.
     unsafe fn read(self, data: *mut c_void, r: usize) -> Value {
         match self {
@@ -375,11 +386,18 @@ unsafe fn copy_finalize_body(info: ffi::duckdb_copy_function_finalize_info) {
             .map(|(i, vals)| {
                 let mut col = Column::new(state.names[i].clone(), vals); // move, plus de clone
                 col.tags = state.kinds[i].tags();
+                if let Some((t, f)) = state.kinds[i].number_format() {
+                    col.number_format.r#type = t.to_string();
+                    col.number_format.fmt = f.to_string();
+                }
                 col
             })
             .collect();
-        let table = WriteTable::new("qvd", cols).map_err(|e| e.to_string())?;
-        table.write_to_path(&state.path).map_err(|e| e.to_string())?;
+        let name = std::path::Path::new(&state.path).file_stem().and_then(|s| s.to_str()).unwrap_or("qvd");
+        let bytes = WriteTable::new(name, cols).and_then(|t| t.to_bytes()).map_err(|e| e.to_string())?;
+        let at = build_no_at(&bytes)?;
+        std::fs::write(&state.path, [&bytes[..at], BUILD_NO, &bytes[at..]].concat())
+            .map_err(|e| format!("{} : {e}", state.path))?;
         Ok(())
     })();
 
@@ -387,6 +405,21 @@ unsafe fn copy_finalize_body(info: ffi::duckdb_copy_function_finalize_info) {
         let c = CString::new(msg).unwrap_or_default();
         ffi::duckdb_copy_function_finalize_set_error(info, c.as_ptr());
     }
+}
+
+/// Qlik Sense charge **0 ligne, sans erreur**, d'un QVD dont l'en-tête n'a pas de
+/// `<QvBuildNo>` (OpenQVD n'en écrit pas ; vérifié sur Qlik Sense client-managed).
+/// Les offsets du corps sont relatifs à la fin de l'en-tête : l'insertion ne décale rien.
+const BUILD_NO: &[u8] = b"  <QvBuildNo>50699</QvBuildNo>\r\n";
+
+/// Position d'insertion de [`BUILD_NO`] : juste après `<QvdTableHeader>`.
+fn build_no_at(bytes: &[u8]) -> Result<usize, String> {
+    const OPEN: &[u8] = b"<QvdTableHeader>\r\n";
+    bytes
+        .windows(OPEN.len())
+        .position(|w| w == OPEN)
+        .map(|i| i + OPEN.len())
+        .ok_or_else(|| "en-tête QVD inattendu (OpenQVD)".to_string())
 }
 
 /// Exécute un callback `extern "C"` en convertissant une panique en erreur DuckDB :
@@ -423,4 +456,23 @@ pub(crate) unsafe fn register(con: ffi::duckdb_connection) -> Result<(), String>
         return Err("échec de l'enregistrement de la copy function qvd".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn en_tete_lisible_par_qlik() {
+        let mut col = Column::new("d", vec![Some(Value::Int(45000)), None]);
+        col.number_format.r#type = "DATE".to_string();
+        let bytes = WriteTable::new("t", vec![col]).unwrap().to_bytes().unwrap();
+        let at = build_no_at(&bytes).unwrap();
+        let fixed = [&bytes[..at], BUILD_NO, &bytes[at..]].concat();
+        let q = openqvd::Qvd::from_bytes(fixed).unwrap();
+        assert_eq!(q.header().build_no.as_deref(), Some("50699"));
+        assert_eq!((q.table_name(), q.num_rows()), ("t", 2));
+        assert_eq!(q.fields()[0].number_format_type(), "DATE");
+        assert_eq!(q.rows().count(), 2);
+    }
 }
