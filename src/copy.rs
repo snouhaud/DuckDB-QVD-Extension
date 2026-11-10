@@ -1,15 +1,17 @@
 //! Écriture QVD : `COPY (SELECT …) TO 'fichier.qvd' (FORMAT qvd)`.
 //!
 //! Copy function de la C API v2 (`duckdb-neo`) : `bind` (noms + types des
-//! colonnes) → `init` (chemin + tampons) → `batch`/`flush` (accumulation des
-//! lots, dans l'ordre) → `finalize` (encodage OpenQVD, écrit via le système de
-//! fichiers virtuel de DuckDB : local ou distant). Toutes les lignes sont
-//! accumulées en mémoire avant l'écriture.
+//! colonnes) → `init` (chemin + encodeurs) → `batch`/`flush` (lots convertis,
+//! puis versés dans l'ordre dans un dictionnaire par colonne) → `finalize`
+//! (en-tête, symboles et lignes empaquetées, écrits par blocs via le système
+//! de fichiers virtuel de DuckDB : local ou distant). En mémoire : les valeurs
+//! distinctes et 4 octets par cellule, pas les lignes elles-mêmes.
 //!
 //! Les noms de colonnes viennent de la requête ; l'option `FIELD_NAMES` permet
 //! de les remplacer. Les types sont taggés pour que [`crate::qvd`] les relise
 //! correctement.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use duckdb_neo::{
@@ -27,7 +29,7 @@ use duckdb_neo::{
     vector::VectorElement,
     Error, Result,
 };
-use openqvd::{Column, Value, WriteTable};
+use openqvd::Value;
 
 use crate::err;
 use crate::qvd::{MICROS_PER_DAY, QLIK_EPOCH_OFFSET_DAYS};
@@ -180,10 +182,228 @@ pub(crate) struct CopyBindData {
     kinds: Vec<WriteKind>,
 }
 
-/// État d'écriture : chemin de sortie + valeurs accumulées par colonne.
+/// État d'écriture : chemin de sortie + encodeur de chaque colonne.
 pub(crate) struct CopyState {
     path: String,
-    columns: Mutex<Vec<Vec<Option<Value>>>>,
+    columns: Mutex<Vec<Encoder>>,
+}
+
+/// Index d'une ligne NULL dans [`Encoder::rows`].
+const NULL: u32 = u32::MAX;
+
+/// Colonne en cours d'encodage : symboles distincts (encodés au format QVD,
+/// numérotés par ordre de première occurrence, comme OpenQVD) et index du
+/// symbole de chaque ligne. Seules les valeurs distinctes sont gardées, plus
+/// 4 octets par cellule.
+// ponytail: index des lignes en mémoire (4 o/cellule, ~0,2 Go pour 50 M de
+// cellules) ; le passer par un fichier temporaire si les tables grossissent encore.
+#[derive(Default)]
+struct Encoder {
+    index_of: HashMap<Box<[u8]>, u32>,
+    rows: Vec<u32>,
+    has_null: bool,
+}
+
+impl Encoder {
+    /// Ajoute une ligne ; `key` est un tampon réutilisé d'un appel à l'autre.
+    fn push(&mut self, value: Option<Value>, key: &mut Vec<u8>) -> Result<()> {
+        let Some(value) = value else {
+            self.has_null = true;
+            self.rows.push(NULL);
+            return Ok(());
+        };
+        key.clear();
+        encode_symbol(&value, key)?;
+        let i = match self.index_of.get(key.as_slice()) {
+            Some(&i) => i,
+            None => {
+                let i = u32::try_from(self.index_of.len()).ok().filter(|&i| i != NULL).ok_or_else(|| {
+                    Error::invalid_input("COPY (FORMAT qvd) : trop de valeurs distinctes".to_string())
+                })?;
+                self.index_of.insert(key.as_slice().into(), i);
+                i
+            }
+        };
+        self.rows.push(i);
+        Ok(())
+    }
+
+    /// Biais Qlik : -2 si la colonne a des NULL (valeurs stockées 0 et 1 = NULL).
+    fn bias(&self) -> i32 {
+        if self.has_null {
+            -2
+        } else {
+            0
+        }
+    }
+
+    /// Nombre de bits par ligne (0 : colonne constante, sans NULL).
+    fn bit_width(&self) -> u32 {
+        let n = self.index_of.len() as u64;
+        let max_stored = match (n, self.has_null) {
+            (0 | 1, false) => return 0,
+            (0, true) => 1,
+            _ => n - 1 + (-self.bias()) as u64,
+        };
+        u64::BITS - max_stored.leading_zeros()
+    }
+
+    /// Valeur stockée pour la ligne `row` (index - biais ; NULL → 0).
+    fn stored(&self, row: usize) -> u64 {
+        match self.rows[row] {
+            NULL => 0,
+            i => i as u64 + (-self.bias()) as u64,
+        }
+    }
+
+    /// Table des symboles, dans l'ordre des index.
+    fn symbols(&self) -> Vec<&[u8]> {
+        let mut out = vec![&[][..]; self.index_of.len()];
+        for (k, &i) in &self.index_of {
+            out[i as usize] = k;
+        }
+        out
+    }
+}
+
+/// Encode un symbole (octet de type + valeur), comme OpenQVD.
+fn encode_symbol(v: &Value, out: &mut Vec<u8>) -> Result<()> {
+    let text = |out: &mut Vec<u8>, s: &str| {
+        if s.as_bytes().contains(&0) {
+            return Err(Error::invalid_input(
+                "COPY (FORMAT qvd) : une chaîne contient l'octet NUL, réservé en fin de symbole".to_string(),
+            ));
+        }
+        out.extend_from_slice(s.as_bytes());
+        out.push(0);
+        Ok(())
+    };
+    match v {
+        Value::Int(i) => {
+            out.push(0x01);
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        Value::Float(f) => {
+            out.push(0x02);
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+        Value::Str(s) => {
+            out.push(0x04);
+            text(out, s)?;
+        }
+        Value::DualInt(d) => {
+            out.push(0x05);
+            out.extend_from_slice(&d.number.to_le_bytes());
+            text(out, &d.text)?;
+        }
+        Value::DualFloat(d) => {
+            out.push(0x06);
+            out.extend_from_slice(&d.number.to_le_bytes());
+            text(out, &d.text)?;
+        }
+    }
+    Ok(())
+}
+
+/// Écrit le QVD (en-tête XML, symboles, lignes empaquetées) par blocs via `write`.
+/// L'en-tête reprend celui d'OpenQVD, plus `<QvBuildNo>` : sans lui, Qlik Sense
+/// charge **0 ligne, sans erreur** (vérifié sur Qlik Sense client-managed).
+fn write_qvd(
+    table: &str,
+    names: &[String],
+    kinds: &[WriteKind],
+    cols: &[Encoder],
+    mut write: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let overflow = || Error::invalid_input("COPY (FORMAT qvd) : fichier trop gros pour le format QVD".to_string());
+    let n_rows = cols.first().map_or(0, |c| c.rows.len());
+    let widths: Vec<u32> = cols.iter().map(Encoder::bit_width).collect();
+    let symbols: Vec<Vec<&[u8]>> = cols.iter().map(Encoder::symbols).collect();
+    let lengths: Vec<u32> = symbols
+        .iter()
+        .map(|s| u32::try_from(s.iter().map(|b| b.len()).sum::<usize>()).map_err(|_| overflow()))
+        .collect::<Result<_>>()?;
+    let record_bits: u32 = widths.iter().sum();
+    let record_bytes = record_bits.div_ceil(8);
+    let body: u32 = lengths.iter().try_fold(0u32, |a, &l| a.checked_add(l)).ok_or_else(overflow)?;
+    let rows_len = u32::try_from(n_rows).ok().and_then(|n| n.checked_mul(record_bytes)).ok_or_else(overflow)?;
+
+    let mut h = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n<QvdTableHeader>\r\n");
+    h += "  <QvBuildNo>50699</QvBuildNo>\r\n";
+    h += &format!("  <TableName>{}</TableName>\r\n  <Fields>\r\n", xml_escape(table));
+    let (mut bit_offset, mut offset) = (0, 0);
+    for (j, (name, kind)) in names.iter().zip(kinds).enumerate() {
+        let (t, fmt) = kind.number_format().unwrap_or(("UNKNOWN", ""));
+        h += &format!(
+            "    <QvdFieldHeader>\r\n      <FieldName>{}</FieldName>\r\n      <BitOffset>{bit_offset}</BitOffset>\r\n      \
+             <BitWidth>{}</BitWidth>\r\n      <Bias>{}</Bias>\r\n      <NumberFormat>\r\n        <Type>{t}</Type>\r\n        \
+             <nDec>0</nDec>\r\n        <UseThou>0</UseThou>\r\n        <Fmt>{fmt}</Fmt>\r\n        <Dec></Dec>\r\n        \
+             <Thou></Thou>\r\n      </NumberFormat>\r\n      <NoOfSymbols>{}</NoOfSymbols>\r\n      <Offset>{offset}</Offset>\r\n      \
+             <Length>{}</Length>\r\n      <Tags>\r\n",
+            xml_escape(name),
+            widths[j],
+            cols[j].bias(),
+            symbols[j].len(),
+            lengths[j],
+        );
+        for tag in kind.tags() {
+            h += &format!("        <String>{tag}</String>\r\n");
+        }
+        h += "      </Tags>\r\n    </QvdFieldHeader>\r\n";
+        bit_offset += widths[j];
+        offset += lengths[j];
+    }
+    h += &format!(
+        "  </Fields>\r\n  <Compression></Compression>\r\n  <RecordByteSize>{record_bytes}</RecordByteSize>\r\n  \
+         <NoOfRecords>{n_rows}</NoOfRecords>\r\n  <Offset>{body}</Offset>\r\n  <Length>{rows_len}</Length>\r\n</QvdTableHeader>\r\n\0"
+    );
+
+    const BLOCK: usize = 1 << 20;
+    let mut buf = Vec::with_capacity(BLOCK + record_bytes as usize);
+    buf.extend_from_slice(h.as_bytes());
+    for s in symbols.iter().flatten() {
+        buf.extend_from_slice(s);
+        if buf.len() >= BLOCK {
+            write(&buf)?;
+            buf.clear();
+        }
+    }
+    let rbs = record_bytes as usize;
+    for row in 0..n_rows {
+        let start = buf.len();
+        buf.resize(start + rbs, 0);
+        let mut pos = 0;
+        for (c, &w) in cols.iter().zip(&widths) {
+            write_bits(&mut buf[start..], pos, w, c.stored(row));
+            pos += w;
+        }
+        if buf.len() >= BLOCK {
+            write(&buf)?;
+            buf.clear();
+        }
+    }
+    write(&buf)
+}
+
+/// Range les `width` bits de poids faible de `value` à partir du bit `pos`
+/// (LSB d'abord, octets little-endian).
+fn write_bits(buf: &mut [u8], mut pos: u32, mut width: u32, mut value: u64) {
+    while width > 0 {
+        let off = pos % 8;
+        let take = (8 - off).min(width);
+        buf[(pos / 8) as usize] |= ((value as u8) & ((1u16 << take) - 1) as u8) << off;
+        value >>= take;
+        pos += take;
+        width -= take;
+    }
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 /// Format `qvd` des copy functions (COPY TO ici, COPY FROM dans
@@ -243,7 +463,8 @@ impl CopyToFunctionCallbacks for QvdFormat {
     }
 
     fn init(&self, _context: &Context, bind: &Self::BindData, file_path: &str) -> Result<Self::InitData> {
-        Ok(CopyState { path: file_path.to_string(), columns: Mutex::new(vec![Vec::new(); bind.kinds.len()]) })
+        let columns = bind.kinds.iter().map(|_| Encoder::default()).collect();
+        Ok(CopyState { path: file_path.to_string(), columns: Mutex::new(columns) })
     }
 
     fn batch(
@@ -263,7 +484,8 @@ impl CopyToFunctionCallbacks for QvdFormat {
         Ok(columns)
     }
 
-    /// Les lots sont vidés dans l'ordre : on les ajoute aux tampons.
+    /// Les lots sont vidés dans l'ordre : leurs valeurs passent dans les
+    /// dictionnaires (l'ordre des symboles, donc le fichier, est déterministe).
     fn flush(
         &self,
         _context: &Context,
@@ -273,21 +495,63 @@ impl CopyToFunctionCallbacks for QvdFormat {
         batch: &mut Self::BatchData,
     ) -> Result<()> {
         let mut columns = state.columns.lock().map_err(err)?;
+        let mut key = Vec::new();
         for (dst, src) in columns.iter_mut().zip(batch.iter_mut()) {
-            dst.append(src);
+            for v in src.drain(..) {
+                dst.push(v, &mut key)?;
+            }
         }
         Ok(())
     }
 
     fn finalize(&self, context: &Context, bind: &Self::BindData, state: &Self::InitData) -> Result<()> {
         let columns = std::mem::take(&mut *state.columns.lock().map_err(err)?);
-        let cols = bind
-            .names
+        let table = std::path::Path::new(&state.path).file_stem().and_then(|s| s.to_str()).unwrap_or("qvd");
+        let fs = FileSystem::new(context)?;
+        let file = FileBuilder::new(&fs, &state.path)?.write().create_new().open()?;
+        write_qvd(table, &bind.names, &bind.kinds, &columns, |mut rest| {
+            while !rest.is_empty() {
+                match file.write(rest)? {
+                    0 => return Err(Error::invalid_input(format!("écriture interrompue : {}", state.path))),
+                    n => rest = &rest[n..],
+                }
+            }
+            Ok(())
+        })?;
+        file.close()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openqvd::{Column, Dual, WriteTable};
+
+    /// Encode `cols` avec [`write_qvd`].
+    fn ours(cols: &[(WriteKind, Vec<Option<Value>>)]) -> Vec<u8> {
+        let names: Vec<String> = (0..cols.len()).map(|j| format!("c{j}")).collect();
+        let kinds: Vec<WriteKind> = cols.iter().map(|c| c.0).collect();
+        let mut key = Vec::new();
+        let encs: Vec<Encoder> = cols
             .iter()
-            .zip(&bind.kinds)
-            .zip(columns)
-            .map(|((name, kind), vals)| {
-                let mut col = Column::new(name.clone(), vals);
+            .map(|(_, vals)| {
+                let mut e = Encoder::default();
+                vals.iter().for_each(|v| e.push(v.clone(), &mut key).unwrap());
+                e
+            })
+            .collect();
+        let mut out = Vec::new();
+        write_qvd("t", &names, &kinds, &encs, |b| Ok(out.extend_from_slice(b))).unwrap();
+        out
+    }
+
+    /// Même table par OpenQVD (l'ancien chemin d'écriture), `<QvBuildNo>` inséré.
+    fn openqvd(cols: &[(WriteKind, Vec<Option<Value>>)]) -> Vec<u8> {
+        let cols = cols
+            .iter()
+            .enumerate()
+            .map(|(j, (kind, vals))| {
+                let mut col = Column::new(format!("c{j}"), vals.clone());
                 col.tags = kind.tags();
                 if let Some((t, f)) = kind.number_format() {
                     col.number_format.r#type = t.to_string();
@@ -296,54 +560,49 @@ impl CopyToFunctionCallbacks for QvdFormat {
                 col
             })
             .collect();
-        let table = std::path::Path::new(&state.path).file_stem().and_then(|s| s.to_str()).unwrap_or("qvd");
-        let bytes = WriteTable::new(table, cols).map_err(err)?.to_bytes().map_err(err)?;
-        let at = build_no_at(&bytes)?;
-
-        let fs = FileSystem::new(context)?;
-        let file = FileBuilder::new(&fs, &state.path)?.write().create_new().open()?;
-        for mut rest in [&bytes[..at], BUILD_NO, &bytes[at..]] {
-            while !rest.is_empty() {
-                match file.write(rest)? {
-                    0 => return Err(Error::invalid_input(format!("écriture interrompue : {}", state.path))),
-                    n => rest = &rest[n..],
-                }
-            }
-        }
-        file.close()
+        let bytes = WriteTable::new("t", cols).unwrap().to_bytes().unwrap();
+        const OPEN: &[u8] = b"<QvdTableHeader>\r\n";
+        let at = bytes.windows(OPEN.len()).position(|w| w == OPEN).unwrap() + OPEN.len();
+        [&bytes[..at], b"  <QvBuildNo>50699</QvBuildNo>\r\n", &bytes[at..]].concat()
     }
-}
-
-/// Qlik Sense charge **0 ligne, sans erreur**, d'un QVD dont l'en-tête n'a pas de
-/// `<QvBuildNo>` (OpenQVD n'en écrit pas ; vérifié sur Qlik Sense client-managed).
-/// Les offsets du corps sont relatifs à la fin de l'en-tête : l'insertion ne décale rien.
-const BUILD_NO: &[u8] = b"  <QvBuildNo>50699</QvBuildNo>\r\n";
-
-/// Position d'insertion de [`BUILD_NO`] : juste après `<QvdTableHeader>`.
-fn build_no_at(bytes: &[u8]) -> Result<usize> {
-    const OPEN: &[u8] = b"<QvdTableHeader>\r\n";
-    bytes
-        .windows(OPEN.len())
-        .position(|w| w == OPEN)
-        .map(|i| i + OPEN.len())
-        .ok_or_else(|| Error::invalid_input("en-tête QVD inattendu (OpenQVD)".to_string()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
-    fn en_tete_lisible_par_qlik() {
-        let mut col = Column::new("d", vec![Some(Value::Int(45000)), None]);
-        col.number_format.r#type = "DATE".to_string();
-        let bytes = WriteTable::new("t", vec![col]).unwrap().to_bytes().unwrap();
-        let at = build_no_at(&bytes).unwrap();
-        let fixed = [&bytes[..at], BUILD_NO, &bytes[at..]].concat();
-        let q = openqvd::Qvd::from_bytes(fixed).unwrap();
+    fn identique_a_openqvd() {
+        let s = |x: &str| Some(Value::Str(x.to_string()));
+        let wide: Vec<Option<Value>> = (0..70_000).map(|i| Some(Value::Int(i % 40_000))).collect();
+        let cases: Vec<Vec<(WriteKind, Vec<Option<Value>>)>> = vec![
+            vec![(WriteKind::Date, vec![Some(Value::Int(45000)), None])],
+            vec![
+                (WriteKind::Str, vec![s("a<&>'\""), s("b"), s("a<&>'\""), None, s("é")]),
+                (WriteKind::I32, vec![Some(Value::Int(1)); 5]),
+                (WriteKind::F64, vec![Some(Value::Float(1.5)), None, None, Some(Value::Float(-0.0)), Some(Value::Float(2.0))]),
+                (WriteKind::Timestamp, vec![None; 5]),
+                (
+                    WriteKind::Str,
+                    vec![
+                        Some(Value::DualInt(Dual { number: 1, text: "1".into() })),
+                        Some(Value::DualFloat(Dual { number: 1.5, text: "1,5".into() })),
+                        s("x"),
+                        s("x"),
+                        s("y"),
+                    ],
+                ),
+            ],
+            // > 64 bits par ligne et une colonne de 16 bits
+            (0..5).map(|_| (WriteKind::I32, wide.clone())).collect(),
+            vec![(WriteKind::Str, vec![])],
+        ];
+        for cols in &cases {
+            assert!(ours(cols) == openqvd(cols), "écart avec OpenQVD pour {} colonne(s)", cols.len());
+        }
+        let q = openqvd::Qvd::from_bytes(ours(&cases[0])).unwrap();
         assert_eq!(q.header().build_no.as_deref(), Some("50699"));
-        assert_eq!((q.table_name(), q.num_rows()), ("t", 2));
         assert_eq!(q.fields()[0].number_format_type(), "DATE");
-        assert_eq!(q.rows().count(), 2);
+    }
+
+    #[test]
+    fn nul_refuse() {
+        let mut e = Encoder::default();
+        assert!(e.push(Some(Value::Str("a\0b".into())), &mut Vec::new()).is_err());
     }
 }
