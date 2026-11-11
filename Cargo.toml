@@ -1,8 +1,8 @@
 [package]
 name = "qvd_next"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
-description = "Extension DuckDB pour lire (qvdrs) et écrire (OpenQVD) les fichiers Qlik QVD"
+description = "Extension DuckDB pour lire (qvdrs) et écrire les fichiers Qlik QVD"
 license = "Apache-2.0"
 
 [lib]

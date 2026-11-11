@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "qvd_next"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "duckdb-loadable-macros",
  "duckdb-neo",
