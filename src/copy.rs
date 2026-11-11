@@ -329,7 +329,7 @@ fn write_qvd(
     let rows_len = u32::try_from(n_rows).ok().and_then(|n| n.checked_mul(record_bytes)).ok_or_else(overflow)?;
 
     let mut h = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n<QvdTableHeader>\r\n");
-    h += "  <QvBuildNo>50699</QvBuildNo>\r\n";
+    h += QLIK_HEAD;
     h += &format!("  <TableName>{}</TableName>\r\n  <Fields>\r\n", xml_escape(table));
     let (mut bit_offset, mut offset) = (0, 0);
     for (j, (name, kind)) in names.iter().zip(kinds).enumerate() {
@@ -397,6 +397,12 @@ fn write_bits(buf: &mut [u8], mut pos: u32, mut width: u32, mut value: u64) {
         width -= take;
     }
 }
+
+/// Balises d'en-tête qu'écrit Qlik après `<QvdTableHeader>`. Sans le bloc complet, l'assistant de
+/// chargement de Qlik Sense détecte le fichier comme du XML (vérifié par `GuessFileType`).
+const QLIK_HEAD: &str = "  <QvBuildNo>50699</QvBuildNo>\r\n  <CreatorDoc></CreatorDoc>\r\n  <CreateUtcTime></CreateUtcTime>\r\n  \
+    <SourceCreateUtcTime></SourceCreateUtcTime>\r\n  <SourceFileUtcTime></SourceFileUtcTime>\r\n  \
+    <SourceFileSize>-1</SourceFileSize>\r\n  <StaleUtcTime></StaleUtcTime>\r\n";
 
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -563,7 +569,7 @@ mod tests {
         let bytes = WriteTable::new("t", cols).unwrap().to_bytes().unwrap();
         const OPEN: &[u8] = b"<QvdTableHeader>\r\n";
         let at = bytes.windows(OPEN.len()).position(|w| w == OPEN).unwrap() + OPEN.len();
-        [&bytes[..at], b"  <QvBuildNo>50699</QvBuildNo>\r\n", &bytes[at..]].concat()
+        [&bytes[..at], QLIK_HEAD.as_bytes(), &bytes[at..]].concat()
     }
 
     #[test]
