@@ -2,8 +2,9 @@
 
 **100% Rust** DuckDB extension to **read and write** Qlik **QVD** files.
 **Reading** relies on [`qvd` (qvdrs)](https://github.com/bintocher/qvdrs)
-(a **streaming** reader with bounded memory); **writing** relies on
-[OpenQVD](https://github.com/Sigilweaver/OpenQVD) (fine-grained tag control).
+(a **streaming** reader with bounded memory); **writing** is a built-in
+encoder that keeps only distinct values in memory (byte-for-byte the output of
+[OpenQVD](https://github.com/Sigilweaver/OpenQVD), plus `<QvBuildNo>`).
 
 ```sql
 SELECT * FROM read_qvd('sales.qvd');
@@ -87,7 +88,8 @@ COPY (SELECT id, amount, sale_date FROM sales) TO 'export.qvd' (FORMAT qvd);
 
 Implemented via a **copy function** of the C API (not wrapped by duckdb-rs,
 driven in FFI in [`src/copy.rs`](src/copy.rs)): `bind` (types) →
-`global_init` (path) → `sink` (accumulation) → `finalize` (OpenQVD write).
+`global_init` (path) → `sink` (per-column symbol dictionaries) → `finalize`
+(header, symbols and packed rows, written in blocks).
 Types are preserved and tagged for reading back (`BIGINT`/`DOUBLE`/`VARCHAR`/
 `DATE`/`TIMESTAMP`/`TIME`/`INTERVAL`; `DECIMAL` becomes `DOUBLE`), `NULL` and
 UTF-8 are kept. Verified in a round-trip
@@ -141,19 +143,19 @@ a mismatch is a bind error. To convert, use
   scales with the projection, not the total column count. The index block's
   **bytes** are still read in full (fields are bit-interleaved in each record — a
   QVD format trait).
-- **Writing** (`COPY TO`) still accumulates all rows in memory (OpenQVD writer).
+- **Writing** (`COPY TO`) keeps the distinct values plus 4 bytes per cell in memory.
 - Local glob only (no DuckDB file system: neither httpfs nor S3).
 
 ## Important limitations and behaviour notes
 
 ### Writing memory usage
 
-`COPY ... TO ... (FORMAT qvd)` accumulates **all rows in memory** before writing
-(`src/copy.rs`). This is a limitation of the underlying OpenQVD writer, not of
-DuckDB. For small and medium files this is fine, but for very large outputs you
-should expect memory consumption proportional to the total row count × column
-count. If you hit memory limits, split the output into smaller chunks (for
-example with `LIMIT`/`OFFSET` or by partition) or export to another format.
+`COPY ... TO ... (FORMAT qvd)` keeps, per column, the **distinct values** (the
+QVD symbol table) and a 4-byte symbol index **per cell** in memory until the file
+is written (`src/copy.rs`); this memory is outside DuckDB's `memory_limit`. The
+QVD layout requires it: the header gives each field's bit width, known only once
+all distinct values are seen. Example: 2.2 M rows × 20 columns (mostly text) take
+about 0.55 GB, against 3.1 GB for the OpenQVD writer used up to 1.0.8.
 
 ### Column names in `COPY ... TO`
 
@@ -251,7 +253,7 @@ further cuts I/O and memory on wide files.
 | ------------------------------ | ----------------------------------------------------------------------------------------------- |
 | `src/lib.rs`                   | C-API entrypoint + `read_qvd` VTab (DuckDB plumbing, streaming)                                 |
 | `src/qvd.rs`                   | QVD format: header validation/typing, projected symbol + index decode, conversions + unit tests |
-| `src/copy.rs`                  | `COPY ... TO (FORMAT qvd)`: copy function (raw FFI), OpenQVD writer                             |
+| `src/copy.rs`                  | `COPY ... TO (FORMAT qvd)`: copy function (raw FFI), QVD encoder                                |
 | `src/copy_from.rs`             | `COPY ... FROM (FORMAT qvd)`: copy-from table function (raw FFI)                                |
 | `src/wasm_lib.rs`              | Re-export for the Wasm target (staticlib)                                                       |
 | `Cargo.toml`                   | Dependencies (`duckdb`, `qvd`/qvdrs, `openqvd`, `glob`)                                         |
