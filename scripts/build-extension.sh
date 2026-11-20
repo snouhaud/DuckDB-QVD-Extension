@@ -3,7 +3,7 @@
 # puis appose le footer de métadonnées DuckDB avec le script de extension-ci-tools.
 #
 # C API v2, ABI unstable (C_STRUCT_UNSTABLE) : la version stampée est la version
-# exacte de DuckDB (v2.0.0, comme TARGET_DUCKDB_VERSION du Makefile) ; le binaire
+# exacte de DuckDB (v2.0.1, comme TARGET_DUCKDB_VERSION du Makefile) ; le binaire
 # ne se charge que sur celle-ci.
 set -euo pipefail
 
@@ -25,7 +25,7 @@ case "$(uname -s)-$(uname -m)" in
 esac
 
 # 3. Version exacte de DuckDB visée.
-DUCKDB_VERSION="v2.0.0"
+DUCKDB_VERSION="v2.0.1"
 echo "Plateforme=$PLATFORM  DuckDB=$DUCKDB_VERSION"
 
 # 4. Apposer le footer de métadonnées.

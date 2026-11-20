@@ -14,10 +14,10 @@ use std::io::{self, Read, Seek, SeekFrom};
 
 use duckdb_loadable_macros::duckdb_entrypoint_c_api_v2;
 use duckdb_neo::{
-    bind_arguments::BindArgument,
+    bind_arguments::BindArguments,
     connection::Context,
     copy_function::CopyFunctionBuilder,
-    data_chunk::DataChunkRef,
+    data_chunk::DataChunk,
     extension::Extension,
     file::{File, FileBuilder, FileSystem},
     logical_type::LogicalType,
@@ -27,7 +27,7 @@ use duckdb_neo::{
         TableFunctionCallbacks,
     },
     types::{DateValue, IntervalValue, TimeValue, TimestampValue},
-    vector::VectorElement,
+    vector::WritableNativeElement,
     DuckDBType, Error, Result,
 };
 
@@ -54,14 +54,13 @@ impl TableFunctionCallbacks for ReadQvd {
     fn bind(
         &self,
         context: &Context,
-        arguments: Vec<BindArgument>,
+        arguments: BindArguments<'_>,
         bind: BindFunctionHandle<'_>,
     ) -> Result<Self::BindData> {
-        let pattern = arguments[0]
-            .value
-            .as_ref()
-            .and_then(|v| v.get::<String>().transpose())
-            .transpose()?
+        let pattern = arguments
+            .arg(0)?
+            .resolved_value::<String>()?
+            .flatten()
             .ok_or_else(|| Error::invalid_input("read_qvd : chemin NULL"))?;
         let paths = expand_glob(context, &pattern)?;
 
@@ -77,26 +76,26 @@ impl TableFunctionCallbacks for ReadQvd {
     /// décodage de l'index ici). Un seul thread : le scan est séquentiel.
     fn init_global_state(
         &self,
-        bind: &Self::BindData,
         _context: &Context,
+        bind: &Self::BindData,
         columns: InitColumnData<'_>,
-    ) -> Result<(Option<Self::GlobalState>, Option<usize>)> {
+    ) -> Result<Option<Self::GlobalState>> {
         let indices = (0..columns.count()?)
             .map(|i| columns.get_column_index(i))
             .collect::<Result<Vec<_>>>()?;
         let scan = QvdScan::new(&bind.paths, &bind.names, &bind.kinds, &indices).map_err(err)?;
-        Ok((Some(scan), Some(1)))
+        Ok(Some(scan))
     }
 
     /// Tire un chunk du scan streaming et le copie dans la sortie DuckDB.
     /// Un chunk vide signale la fin.
     fn exec(
         &self,
-        _bind: &Self::BindData,
-        scan: Option<&Self::GlobalState>,
-        _local: Option<&mut Self::LocalState>,
         context: &Context,
-        mut output: DataChunkRef<'_>,
+        _bind: &Self::BindData,
+        _local: Option<&mut Self::LocalState>,
+        scan: Option<&Self::GlobalState>,
+        output: &mut DataChunk<'_>,
         _columns: ExecColumnInfo<'_>,
     ) -> Result<()> {
         let scan = scan.ok_or_else(|| Error::internal("read_qvd : état de scan absent"))?;
@@ -104,7 +103,7 @@ impl TableFunctionCallbacks for ReadQvd {
             Pull::Done => {}
             Pull::Cells { columns } => {
                 for (j, &kind) in scan.output_kinds().iter().enumerate() {
-                    write_cells(&mut output, j, kind, &columns[j])?;
+                    write_cells(output, j, kind, &columns[j])?;
                 }
             }
         }
@@ -127,14 +126,14 @@ pub(crate) fn logical_type(kind: Kind, context: &Context) -> Result<LogicalType>
 
 /// Écrit une colonne de `Cell` (déjà convertis) dans le vecteur `j` de la
 /// sortie ; `Cell::Null` (ou une valeur d'un autre type) donne NULL.
-pub(crate) fn write_cells(output: &mut DataChunkRef<'_>, j: usize, kind: Kind, cells: &[Cell]) -> Result<()> {
+pub(crate) fn write_cells(output: &mut DataChunk<'_>, j: usize, kind: Kind, cells: &[Cell]) -> Result<()> {
     match kind {
         Kind::Text => {
             let mut v = output.get_vector_at_mut::<String>(j)?;
             v.set_size(cells.len())?;
             let mut w = v.writer()?;
             for (r, c) in cells.iter().enumerate() {
-                w.set(r, if let Cell::Str(s) = c { Some(s.as_str()) } else { None })?;
+                w.set_option(r, if let Cell::Str(s) = c { Some(s.as_str()) } else { None })?;
             }
             Ok(())
         }
@@ -150,16 +149,15 @@ pub(crate) fn write_cells(output: &mut DataChunkRef<'_>, j: usize, kind: Kind, c
     }
 }
 
-fn write_typed<T>(output: &mut DataChunkRef<'_>, j: usize, cells: &[Cell], f: impl Fn(&Cell) -> Option<T>) -> Result<()>
+fn write_typed<T>(output: &mut DataChunk<'_>, j: usize, cells: &[Cell], f: impl Fn(&Cell) -> Option<T>) -> Result<()>
 where
-    T: VectorElement + duckdb_neo::vector::WritableVectorElement,
-    for<'a> T: duckdb_neo::vector::WritableVectorElement<Write<'a> = T>,
+    T: WritableNativeElement<Write = T>,
 {
     let mut v = output.get_vector_at_mut::<T>(j)?;
     v.set_size(cells.len())?;
     let mut w = v.writer()?;
     for (r, c) in cells.iter().enumerate() {
-        w.set(r, f(c))?;
+        w.set_option(r, f(c).as_ref())?;
     }
     Ok(())
 }
@@ -222,7 +220,7 @@ pub(crate) fn io_err(e: Error) -> io::Error {
 
 /// Point d'entrée (`qvd_next_init_c_api_v2`) : enregistre la table function
 /// `read_qvd` et la copy function `qvd` (COPY TO et COPY FROM).
-#[duckdb_entrypoint_c_api_v2(extension_name = "qvd_next", api_version = "v2.0.0")]
+#[duckdb_entrypoint_c_api_v2(extension_name = "qvd_next", api_version = "v2.0.1")]
 fn entrypoint(extension: &Extension) -> Result<()> {
     TableFunctionBuilder::new(
         "read_qvd",
