@@ -1,6 +1,6 @@
 [package]
 name = "qvd"
-version = "1.0.9"
+version = "1.0.10"
 edition = "2021"
 description = "Extension DuckDB pour lire (qvdrs) et écrire (OpenQVD) les fichiers Qlik QVD"
 license = "Apache-2.0"
@@ -23,7 +23,7 @@ crate-type = ["staticlib"]
 
 [dependencies]
 # Plomberie de l'extension DuckDB (table functions, VTab, entrypoint C-API).
-duckdb = { version = "=1.20000.0", features = ["loadable-extension"] }
+duckdb = { version = "=1.20001.0", features = ["loadable-extension"] }
 
 # Lecture QVD : primitives bas niveau (en-tête, symboles, index) du crate qvdrs.
 # Renommé pour éviter la collision avec le nom de package "qvd" ci-dessus.
