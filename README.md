@@ -14,7 +14,7 @@ COPY sales FROM 'output.qvd' (FORMAT qvd);
 
 ## Project status
 
-**Reading is functional, verified in live DuckDB (v2.0.0).** The extension
+**Reading is functional, verified in live DuckDB (v2.0.1).** The extension
 registers itself, declares the `read_qvd(VARCHAR)` table function, and reads QVD
 files in **streaming projected** mode via `qvdrs`' low-level primitives: a DuckDB
 type is inferred per field from the header alone (at `bind`), then — for the

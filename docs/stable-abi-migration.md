@@ -30,7 +30,7 @@ No source change was needed: only `USE_UNSTABLE_C_API=0` and
 ## What it buys
 
 One binary loads on every DuckDB providing the V1 C API `v1.5.6`: verified on
-**1.5.6 and 2.0.0** with the same build (`duckdb` crate `1.20000.0`). A DuckDB
+**1.5.6, 2.0.0 and 2.0.1** with the same build (`duckdb` crate `1.20001.0`). A DuckDB
 release no longer forces a rebuild; bumping the crate is now optional (tests run
 against the DuckDB version the crate encodes, via `DUCKDB_TEST_VERSION`).
 
