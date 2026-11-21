@@ -18,7 +18,7 @@ use duckdb_neo::{
     column_data_collection::ColumnDataCollection,
     connection::Context,
     copy_function::{CopyToBindInfo, CopyToFunctionCallbacks},
-    data_chunk::DataChunkRef,
+    data_chunk::DataChunk,
     file::{FileBuilder, FileSystem},
     logical_type::{LogicalType, LogicalTypeID},
     types::{
@@ -26,7 +26,7 @@ use duckdb_neo::{
         TimestampValue, WordDecimal,
     },
     value::Value as DuckValue,
-    vector::VectorElement,
+    vector::ReadableNativeElement,
     Error, Result,
 };
 use openqvd::Value;
@@ -66,19 +66,19 @@ impl WriteKind {
     /// Déduit la stratégie d'un type logique (largeur/échelle pour `DECIMAL`).
     fn of_logical_type(lt: &LogicalType) -> Result<Option<Self>> {
         Ok(Some(match lt.id()? {
-            LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_BOOLEAN => WriteKind::Bool,
-            LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_TINYINT => WriteKind::I8,
-            LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_SMALLINT => WriteKind::I16,
-            LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_INTEGER => WriteKind::I32,
-            LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_BIGINT => WriteKind::I64,
-            LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_FLOAT => WriteKind::F32,
-            LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_DOUBLE => WriteKind::F64,
-            LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_VARCHAR => WriteKind::Str,
-            LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_DATE => WriteKind::Date,
-            LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_TIMESTAMP => WriteKind::Timestamp,
-            LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_TIME => WriteKind::Time,
-            LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_INTERVAL => WriteKind::Interval,
-            LogicalTypeID::DUCKDB_V2_LOGICAL_TYPE_ID_DECIMAL => {
+            LogicalTypeID::Boolean => WriteKind::Bool,
+            LogicalTypeID::TinyInt => WriteKind::I8,
+            LogicalTypeID::SmallInt => WriteKind::I16,
+            LogicalTypeID::Integer => WriteKind::I32,
+            LogicalTypeID::BigInt => WriteKind::I64,
+            LogicalTypeID::Float => WriteKind::F32,
+            LogicalTypeID::Double => WriteKind::F64,
+            LogicalTypeID::Varchar => WriteKind::Str,
+            LogicalTypeID::Date => WriteKind::Date,
+            LogicalTypeID::Timestamp => WriteKind::Timestamp,
+            LogicalTypeID::Time => WriteKind::Time,
+            LogicalTypeID::Interval => WriteKind::Interval,
+            LogicalTypeID::Decimal => {
                 let sig = DecimalSignature::from_logical_type(lt)?;
                 let phys = match sig.width {
                     1..=4 => DecimalPhys::I16,
@@ -120,7 +120,7 @@ impl WriteKind {
     }
 
     /// Lit la colonne `j` du chunk et ajoute ses valeurs converties à `out`.
-    fn read(self, chunk: &DataChunkRef<'_>, j: usize, out: &mut Vec<Option<Value>>) -> Result<()> {
+    fn read(self, chunk: &DataChunk<'_>, j: usize, out: &mut Vec<Option<Value>>) -> Result<()> {
         match self {
             WriteKind::Bool => push::<bool>(chunk, j, out, |v| Value::Int(*v as i32)),
             WriteKind::I8 => push::<i8>(chunk, j, out, |v| Value::Int(*v as i32)),
@@ -166,10 +166,10 @@ impl WriteKind {
 }
 
 /// Lit un vecteur de type `T` et pousse chaque valeur convertie (`None` = NULL).
-fn push<T>(chunk: &DataChunkRef<'_>, j: usize, out: &mut Vec<Option<Value>>, f: impl Fn(&T) -> Value) -> Result<()>
+fn push<T>(chunk: &DataChunk<'_>, j: usize, out: &mut Vec<Option<Value>>, f: impl Fn(&T) -> Value) -> Result<()>
 where
-    T: VectorElement + 'static,
-    for<'a> T: VectorElement<Ref<'a> = &'a T>,
+    T: ReadableNativeElement + 'static,
+    for<'a> T: ReadableNativeElement<Ref<'a> = &'a T>,
 {
     let reader = chunk.get_vector_at::<T>(j)?.reader()?;
     out.extend(reader.iter().map(|v| v.map(&f)));

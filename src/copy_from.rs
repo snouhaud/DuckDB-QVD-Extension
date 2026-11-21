@@ -8,8 +8,8 @@
 
 use duckdb_neo::{
     connection::{Context, FFILink},
-    copy_function::{CopyFromBindInfo, CopyFromCardinality, CopyFromFunctionCallbacks},
-    data_chunk::DataChunkRef,
+    copy_function::{CopyFromBindInfo, CopyFromFunctionCallbacks},
+    data_chunk::DataChunk,
     logical_type::LogicalType,
     value::{Value, ValueInput},
     Error, Result,
@@ -39,7 +39,7 @@ impl CopyFromFunctionCallbacks for QvdFormat {
         context: &Context,
         file_path: &str,
         info: &CopyFromBindInfo,
-    ) -> Result<(Self::BindData, Option<CopyFromCardinality>)> {
+    ) -> Result<Self::BindData> {
         let schema = qvd::read_schema(file_path, &vfs_open(context)).map_err(err)?;
         let n = info.column_count()?;
         if schema.names.len() < n {
@@ -62,28 +62,28 @@ impl CopyFromFunctionCallbacks for QvdFormat {
             kinds: schema.kinds.into_iter().take(n).collect(),
             casts,
         };
-        Ok((bind, None))
+        Ok(bind)
     }
 
     /// Scan streaming de tous les champs retenus. Un seul thread.
     fn init_global_state(
         &self,
-        bind: &Self::BindData,
         _context: &Context,
-    ) -> Result<(Option<Self::GlobalState>, Option<std::num::NonZeroUsize>)> {
+        bind: &Self::BindData,
+    ) -> Result<Option<Self::GlobalState>> {
         let indices: Vec<usize> = (0..bind.kinds.len()).collect();
         let scan = QvdScan::new(std::slice::from_ref(&bind.path), &bind.names, &bind.kinds, &indices).map_err(err)?;
-        Ok((Some(scan), std::num::NonZeroUsize::new(1)))
+        Ok(Some(scan))
     }
 
     /// Un lot vide signale la fin de la lecture.
     fn exec(
         &self,
-        bind: &Self::BindData,
-        scan: Option<&Self::GlobalState>,
-        _local: Option<&mut Self::LocalState>,
         context: &Context,
-        mut output: DataChunkRef<'_>,
+        bind: &Self::BindData,
+        _local: Option<&mut Self::LocalState>,
+        scan: Option<&Self::GlobalState>,
+        output: &mut DataChunk<'_>,
     ) -> Result<()> {
         let scan = scan.ok_or_else(|| Error::internal("COPY FROM qvd : état de scan absent"))?;
         let Pull::Cells { columns } = scan.pull(&vfs_open(context)).map_err(err)? else {
@@ -92,14 +92,14 @@ impl CopyFromFunctionCallbacks for QvdFormat {
         for (j, cells) in columns.iter().enumerate() {
             let kind = bind.kinds[j];
             match &bind.casts[j] {
-                None => write_cells(&mut output, j, kind, cells)?,
+                None => write_cells(output, j, kind, cells)?,
                 Some(target) => {
                     let target = LogicalType::from_text(context, target)?;
                     let [mut v] = output.get_vector_array_mut([j])?;
                     v.set_size(cells.len())?;
                     for (r, cell) in cells.iter().enumerate() {
                         match cell_value(context, kind, cell)? {
-                            Some(value) => v.write_value_slow(r, value.cast(context, &target)?)?,
+                            Some(value) => v.write_value_slow(r, &value.cast(context, &target)?)?,
                             None => v.set_null_slow(r)?,
                         }
                     }

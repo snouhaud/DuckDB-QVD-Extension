@@ -8,7 +8,7 @@
 > - `read_qvd(path)` is documented in `duckdb_functions()` (description, examples).
 >
 > Trade-off: the C API v2 is not stable yet, so a `qvd_next` binary loads on **one
-> exact DuckDB version** (2.0.0), and `duckdb-neo` is experimental. `qvd` (stable C
+> exact DuckDB version** (2.0.1), and `duckdb-neo` is experimental. `qvd` (stable C
 > ABI, one binary for DuckDB 1.5.6 and 2.0.x) stays the conservative choice.
 > **Load only one of them per session**: both register `read_qvd` and `FORMAT qvd`.
 >
@@ -33,7 +33,7 @@ COPY sales FROM 'output.qvd' (FORMAT qvd);
 
 ## Project status
 
-**Reading is functional, verified in live DuckDB (v2.0.0).** The extension
+**Reading is functional, verified in live DuckDB (v2.0.1).** The extension
 registers itself, declares the `read_qvd(VARCHAR)` table function, and reads QVD
 files in **streaming projected** mode via `qvdrs`' low-level primitives: a DuckDB
 type is inferred per field from the header alone (at `bind`), then — for the
@@ -275,7 +275,7 @@ make cargo-build        # or: cargo build
 
 This project uses the official DuckDB **community build template** from
 [`extension-ci-tools`](https://github.com/duckdb/extension-ci-tools), vendored as
-a **git submodule pinned to the `v2.0-cyanoptera` branch** (matching `TARGET_DUCKDB_VERSION`, v2.0.0)
+a **git submodule pinned to the `v2.0-cyanoptera` branch** (matching `TARGET_DUCKDB_VERSION`, v2.0.1)
 — the same flow the community-extensions infrastructure runs. Clone with
 `git clone --recurse-submodules …`, or initialise the submodule after the fact:
 
@@ -289,7 +289,7 @@ make debug              # → build/debug/qvd_next.duckdb_extension
 `make debug` compiles the library and appends the metadata footer via
 `append_extension_metadata.py`. `qvd_next` uses DuckDB's **C API v2**, which has
 no stable surface yet: the footer is `C_STRUCT_UNSTABLE`, stamped with
-`TARGET_DUCKDB_VERSION` (**v2.0.0**), and the binary only loads on that exact
+`TARGET_DUCKDB_VERSION` (**v2.0.1**), and the binary only loads on that exact
 DuckDB version. Each DuckDB release needs a `duckdb-neo` bump and a rebuild.
 
 Loading (unsigned extension):
@@ -300,7 +300,7 @@ duckdb -unsigned -c "LOAD 'build/debug/qvd_next.duckdb_extension'; \
 ```
 
 > A standalone script `./scripts/build-extension.sh` also produces a
-> `build/qvd_next.duckdb_extension` (debug, unstable ABI, DuckDB v2.0.0) without
+> `build/qvd_next.duckdb_extension` (debug, unstable ABI, DuckDB v2.0.1) without
 > the Makefile/venv, handy for quick local checks.
 
 ## Tests

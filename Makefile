@@ -6,7 +6,7 @@ EXTENSION_NAME=qvd_next
 # C API v2 (duckdb-neo) : pas encore de surface stable, donc ABI unstable
 # (C_STRUCT_UNSTABLE) — le binaire ne charge que sur TARGET_DUCKDB_VERSION exacte.
 USE_UNSTABLE_C_API=1
-TARGET_DUCKDB_VERSION := v2.0.0
+TARGET_DUCKDB_VERSION := v2.0.1
 
 # Test against that exact DuckDB (ci-tools otherwise pip-installs the latest).
 DUCKDB_TEST_VERSION := $(patsubst v%,%,$(TARGET_DUCKDB_VERSION))
